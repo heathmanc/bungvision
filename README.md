@@ -1,6 +1,20 @@
-# BungVision Python HMI v0.9.88 - Inference Worker Cleanup
+# BungVision Python HMI v0.9.89 - Production Summary Dashboard
 
-Baseline: v0.9.87 Overlay Pixmap Cache, based on the v0.9.74 out-of-band stop watchdog production foundation.
+Baseline: v0.9.88 Inference Worker Cleanup, based on the v0.9.74 out-of-band stop watchdog production foundation.
+
+## Changes in v0.9.89
+
+- Added a read-only **Production Summary** dashboard for operators and supervisors, opened from a new button in Operator Controls. It aggregates committed PASS/FAIL results into:
+  - **Current Session** (since the last Reset Counts) with parts, PASS, rejects, pass rate, session start time, elapsed time, and parts/hour.
+  - **Today** totals and pass rate across all sessions on the calendar day.
+  - **Today — Reject Breakdown** by coarse reason (Missing bungs / Extra bungs / Pattern invalid / Other) with counts and percent of rejects.
+  - **Last 7 Days** trend table (parts, PASS, rejects, pass rate per day).
+  - **Today — By Hour** throughput table.
+  - The dialog refreshes live every 2 seconds while open and offers **Export CSV** and **Open Logs Folder**.
+- Added a `ProductionStats` aggregate persisted to `logs/production_summary.json` as per-day rollups, so the dashboard and trend survive HMI restarts and shift changes. The file is written atomically (temp file + replace), pruned to the most recent 180 days, and a corrupt/missing file simply starts fresh.
+- Recording hooks into the single battery commit point only (`commit_battery_grade`, the same place pass/fail/total counters increment). The in-memory aggregate updates immediately so the live counters and the dashboard agree; the small JSON persist is queued to the save worker like image/record I/O, so it cannot pause live inspection or PLC updates. A final synchronous flush runs on shutdown.
+- `Reset Counts` now starts a fresh session window for the dashboard but intentionally preserves the persistent per-day history. Failure categories are derived from grade fields, not the free-text reason string.
+- Reporting/UI addition only; no inference scheduling, grading, tracking, PLC, camera, TensorRT, model, or image-size behavior changed.
 
 ## Changes in v0.9.88
 
