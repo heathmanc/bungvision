@@ -3186,17 +3186,30 @@ class ProductionDashboardDialog(QDialog):
 
     def _group(self, title: str) -> Tuple[QGroupBox, QVBoxLayout]:
         box = QGroupBox(title)
+        box.setStyleSheet(
+            "QGroupBox { background:#0f172a; border:1px solid #334155; border-radius:12px;"
+            " margin-top:22px; padding:6px; font-weight:800; color:#cbd5e1; }"
+            "QGroupBox::title { subcontrol-origin:margin; subcontrol-position:top left;"
+            " left:14px; top:4px; padding:0 6px; color:#93c5fd; }"
+        )
         lay = QVBoxLayout(box)
         lay.setContentsMargins(8, 10, 8, 8)
         lay.setSpacing(6)
         return box, lay
 
     def _build_ui(self):
+        self.setStyleSheet(
+            "QDialog { background:#060d1a; }"
+            "QScrollArea { background:#060d1a; border:none; }"
+            "QWidget#dash_content { background:#060d1a; }"
+            "QLabel { background:transparent; border:none; color:#e2e8f0; }"
+        )
         outer = QVBoxLayout(self)
         outer.setContentsMargins(12, 12, 12, 12)
         outer.setSpacing(10)
 
         content = QWidget()
+        content.setObjectName("dash_content")
         root = QVBoxLayout(content)
         root.setContentsMargins(0, 0, 0, 0)
         root.setSpacing(10)
