@@ -45,7 +45,7 @@ from PySide6.QtWidgets import (
 
 from camera_backend import BaslerPylonCamera, create_camera_backend, list_basler_cameras
 
-APP_TITLE = "BungVision Python Line-Side HMI v0.9.89 Production Summary Dashboard"
+APP_TITLE = "BungVision Python Line-Side HMI v0.9.90 Custom Reject Classes"
 ROOT = Path(__file__).resolve().parent
 LOG_DIR = ROOT / "logs"
 FAIL_DIR = ROOT / "fail_snapshots"
@@ -3412,6 +3412,89 @@ class ProductionDashboardDialog(QDialog):
             QMessageBox.warning(self, "Export Production Summary", f"Could not export production summary:\n{exc}")
 
 
+class CustomRejectClassesDialog(QDialog):
+    """Let operators define extra YOLO class labels that trigger an immediate PLC reject latch.
+
+    Any detection whose label (case-insensitive) matches one of these names will
+    latch the reject output as soon as it is seen, independently of the normal
+    battery PASS/FAIL grading pipeline. Typical use: add 'battery_down' so a
+    toppled battery trips the reject without needing bung-count inspection.
+    """
+
+    def __init__(self, parent=None, reject_classes: Optional[List[str]] = None):
+        super().__init__(parent)
+        self.setWindowTitle("Custom Reject Classes")
+        self.setMinimumWidth(380)
+        self.setStyleSheet(
+            "QDialog { background:#060d1a; }"
+            "QLabel { background:transparent; border:none; color:#e2e8f0; }"
+            "QListWidget { background:#0b1220; color:#e2e8f0; border:1px solid #334155;"
+            " border-radius:8px; font-size:13px; }"
+            "QListWidget::item:selected { background:#1e3a5f; color:white; }"
+            "QLineEdit { background:#0f172a; color:#e2e8f0; border:1px solid #334155;"
+            " border-radius:6px; padding:4px 8px; font-size:13px; }"
+            "QPushButton { background:#1e293b; color:#e2e8f0; border:1px solid #334155;"
+            " border-radius:6px; padding:5px 14px; font-size:12px; }"
+            "QPushButton:hover { background:#334155; }"
+        )
+        self._build_ui(reject_classes or [])
+
+    def _build_ui(self, initial: List[str]):
+        lay = QVBoxLayout(self)
+        lay.setSpacing(10)
+        lay.setContentsMargins(14, 14, 14, 14)
+
+        desc = QLabel(
+            "Add YOLO class names below. When any detection matches one of these labels\n"
+            "the PLC reject latch fires immediately, regardless of bung count.\n"
+            "Names are case-insensitive. Example: <b>battery_down</b>"
+        )
+        desc.setWordWrap(True)
+        desc.setStyleSheet("color:#94a3b8; font-size:12px; background:transparent; border:none;")
+        lay.addWidget(desc)
+
+        self.list_widget = QListWidget()
+        self.list_widget.setSelectionMode(QAbstractItemView.SingleSelection)
+        for cls in initial:
+            self.list_widget.addItem(cls.strip().lower())
+        lay.addWidget(self.list_widget)
+
+        add_row = QHBoxLayout()
+        self.new_class_edit = QLineEdit()
+        self.new_class_edit.setPlaceholderText("e.g. battery_down")
+        self.new_class_edit.returnPressed.connect(self._add_class)
+        add_row.addWidget(self.new_class_edit)
+        add_btn = QPushButton("Add")
+        add_btn.clicked.connect(self._add_class)
+        add_row.addWidget(add_btn)
+        lay.addLayout(add_row)
+
+        rm_btn = QPushButton("Remove Selected")
+        rm_btn.clicked.connect(self._remove_selected)
+        lay.addWidget(rm_btn)
+
+        btns = QDialogButtonBox(QDialogButtonBox.Ok | QDialogButtonBox.Cancel)
+        btns.accepted.connect(self.accept)
+        btns.rejected.connect(self.reject)
+        lay.addWidget(btns)
+
+    def _add_class(self):
+        text = self.new_class_edit.text().strip().lower()
+        if not text:
+            return
+        existing = [self.list_widget.item(i).text() for i in range(self.list_widget.count())]
+        if text not in existing:
+            self.list_widget.addItem(text)
+        self.new_class_edit.clear()
+
+    def _remove_selected(self):
+        for item in self.list_widget.selectedItems():
+            self.list_widget.takeItem(self.list_widget.row(item))
+
+    def get_classes(self) -> List[str]:
+        return [self.list_widget.item(i).text() for i in range(self.list_widget.count())]
+
+
 class MainWindow(QMainWindow):
     def __init__(self):
         super().__init__()
@@ -3477,6 +3560,9 @@ class MainWindow(QMainWindow):
         self.session_start_t = dt.datetime.now()
         self.production_stats = ProductionStats(PRODUCTION_SUMMARY_FILE)
         self.production_stats.load()
+
+        # User-defined YOLO class names that trigger an immediate reject latch.
+        self.custom_reject_classes: List[str] = []
 
         # Latched machine-control reject state. This is separate from counters.
         self.reject_latched = False
@@ -3754,6 +3840,9 @@ class MainWindow(QMainWindow):
         self.summary_btn = QPushButton("Production Summary")
         self.summary_btn.setToolTip("Open the read-only production summary: session, today, last 7 days, reject breakdown, and by-hour throughput.")
         self.summary_btn.clicked.connect(lambda _checked=False: self.open_production_dashboard())
+        self.reject_classes_btn = QPushButton("Reject Classes")
+        self.reject_classes_btn.setToolTip("Define YOLO class names that trigger an immediate PLC reject latch (e.g. 'battery_down').")
+        self.reject_classes_btn.clicked.connect(lambda _checked=False: self.open_reject_classes_dialog())
         self.bypass_check = QCheckBox("Bypass (Supervisor)")
         self.bypass_check.setToolTip("Supervisor-only bypass. Bypass inhibits vision stop/alarm requests, but does not make the PLC Ready bit true.")
         self.bypass_check.clicked.connect(lambda checked=False: self.on_bypass_changed(bool(checked)))
@@ -3765,7 +3854,8 @@ class MainWindow(QMainWindow):
         cg.addWidget(self.reset_reject_btn, 2, 0)
         cg.addWidget(self.reset_btn, 2, 1)
         cg.addWidget(self.summary_btn, 3, 0, 1, 2)
-        cg.addWidget(self.bypass_check, 4, 0, 1, 2)
+        cg.addWidget(self.reject_classes_btn, 4, 0, 1, 2)
+        cg.addWidget(self.bypass_check, 5, 0, 1, 2)
         side.addWidget(controls)
 
         overlay_box = QGroupBox("Camera Overlay")
@@ -3953,6 +4043,7 @@ class MainWindow(QMainWindow):
             "plc_ip": self.plc_ip_edit.text().strip() if hasattr(self, "plc_ip_edit") else "",
             "plc_heartbeat_interval_ms": int(getattr(self, "plc_heartbeat_interval_ms", 500)),
             "plc_tags": {key: edit.text().strip() for key, edit in getattr(self, "plc_tag_edits", {}).items()},
+            "custom_reject_classes": list(getattr(self, "custom_reject_classes", [])),
         }
 
     def save_settings(self, silent: bool = False):
@@ -4063,6 +4154,12 @@ class MainWindow(QMainWindow):
                 for key, edit in self.plc_tag_edits.items():
                     if key in tags:
                         edit.setText(str(tags[key]))
+
+            raw_classes = data.get("custom_reject_classes", [])
+            if isinstance(raw_classes, list):
+                self.custom_reject_classes = [str(c).strip().lower() for c in raw_classes if str(c).strip()]
+            else:
+                self.custom_reject_classes = []
 
             self.apply_runtime_settings()
             self.log(f"Settings loaded from {SETTINGS_FILE}; bypass forced OFF at startup.")
@@ -4902,6 +4999,16 @@ class MainWindow(QMainWindow):
         self.reject_latch_time = dt.datetime.now().isoformat(timespec="seconds")
         self.log(f"REJECT LATCHED: ID {self.reject_latch_id} — {self.reject_latch_reason}")
 
+    def latch_reject_for_class(self, label: str, conf: float):
+        """Latch a reject because a custom reject class was detected (no battery grade)."""
+        if self.reject_latched:
+            return
+        self.reject_latched = True
+        self.reject_latch_id = 0
+        self.reject_latch_reason = f"Custom class: {label} ({conf:.0%})"
+        self.reject_latch_time = dt.datetime.now().isoformat(timespec="seconds")
+        self.log(f"REJECT LATCHED (custom class): {label} conf={conf:.2f}")
+
     def reset_counts(self):
         self.total_count = 0
         self.pass_count = 0
@@ -5562,6 +5669,17 @@ class MainWindow(QMainWindow):
             self.log(f"Could not open production summary: {exc}")
             QMessageBox.warning(self, "Production Summary", f"Could not open production summary:\n{exc}")
 
+    def open_reject_classes_dialog(self):
+        dlg = CustomRejectClassesDialog(self, list(self.custom_reject_classes))
+        if dlg.exec() == QDialog.Accepted:
+            self.custom_reject_classes = dlg.get_classes()
+            self.save_settings(silent=True)
+            count = len(self.custom_reject_classes)
+            summary = ", ".join(self.custom_reject_classes[:5])
+            if count > 5:
+                summary += f" … (+{count - 5} more)"
+            self.log(f"Custom reject classes updated ({count}): {summary or 'none'}")
+
     def commit_battery_grade(self, internal_tid: int, grade: BatteryGrade, result: InspectionResult, frame: np.ndarray) -> bool:
         """Commit exactly one PASS/FAIL result for one tracked physical battery.
 
@@ -6013,6 +6131,13 @@ class MainWindow(QMainWindow):
                     self._last_prediction_ok_t = latest_inf.timestamp
                     self._last_prediction_error = ""
                     detections = latest_inf.detections
+                    # Custom reject classes: latch immediately on first matching detection.
+                    if self.custom_reject_classes and not self.reject_latched:
+                        custom_lower = {c.lower() for c in self.custom_reject_classes}
+                        for det in detections:
+                            if det.label.lower() in custom_lower:
+                                self.latch_reject_for_class(det.label, det.conf)
+                                break
                 result = self.inspect(detections, latest_inf.frame)
                 result.fps = self.fps
                 self.update_tracker(result, latest_inf.frame)
