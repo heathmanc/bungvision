@@ -45,7 +45,7 @@ from PySide6.QtWidgets import (
 
 from camera_backend import BaslerPylonCamera, create_camera_backend, list_basler_cameras
 
-APP_TITLE = "BungVision Python Line-Side HMI v0.9.83 Inference Warmup & Preview Cache"
+APP_TITLE = "BungVision Python Line-Side HMI v0.9.84 Inference Parse & PLC Throttle"
 ROOT = Path(__file__).resolve().parent
 LOG_DIR = ROOT / "logs"
 FAIL_DIR = ROOT / "fail_snapshots"
@@ -1325,7 +1325,11 @@ class CameraWidget(QWidget):
             t1 = time.perf_counter()
             display_rgb = cv2.cvtColor(display_bgr, cv2.COLOR_BGR2RGB)
             h, w, ch = display_rgb.shape
-            qimg = QImage(display_rgb.data, w, h, display_rgb.strides[0], QImage.Format_RGB888).copy()
+            # QPixmap.fromImage() deep-copies the pixels into the pixmap's native
+            # format, so the extra QImage.copy() of the numpy buffer is redundant.
+            # display_rgb stays referenced until fromImage() returns, so the view
+            # is valid for the duration of the conversion.
+            qimg = QImage(display_rgb.data, w, h, display_rgb.strides[0], QImage.Format_RGB888)
             self._preview_pixmap = QPixmap.fromImage(qimg)
             t2 = time.perf_counter()
             self._scale_ms = (t1 - t0) * 1000.0
@@ -1735,6 +1739,22 @@ class ModelRunner:
         except Exception:
             return float(default)
 
+    def _array_value(self, value: Any) -> Optional[np.ndarray]:
+        """Convert an Ultralytics tensor attribute to a CPU numpy array once.
+
+        Parsing detections box-by-box previously triggered a separate
+        .detach().cpu().numpy() (a GPU->CPU sync) per detection. Pulling the
+        whole tensor a single time avoids those repeated device syncs.
+        """
+        if value is None:
+            return None
+        try:
+            if hasattr(value, "detach"):
+                value = value.detach().cpu().numpy()
+            return np.asarray(value)
+        except Exception:
+            return None
+
     def predict(self, frame_bgr: np.ndarray, conf: float, iou: float, imgsz: int, device: str = "") -> List[Detection]:
         if self.model is None:
             return []
@@ -1778,20 +1798,18 @@ class ModelRunner:
         # rotated footprint instead of a large axis-aligned rectangle.
         obb = getattr(result, "obb", None)
         if obb is not None:
-            try:
-                obb_items = list(obb)
-            except TypeError:
-                obb_items = []
-            for o in obb_items:
+            # Pull all rotated boxes/confs/classes once instead of per detection.
+            polys_all = self._array_value(getattr(obb, "xyxyxyxy", None))
+            confs_all = self._array_value(getattr(obb, "conf", None))
+            cls_all = self._array_value(getattr(obb, "cls", None))
+            n_obb = int(polys_all.shape[0]) if polys_all is not None and polys_all.ndim >= 1 else 0
+            for i in range(n_obb):
                 try:
-                    cls_id = int(self._scalar_value(getattr(o, "cls", [0]), 0))
-                    det_conf = float(self._scalar_value(getattr(o, "conf", [0.0]), 0.0))
+                    det_conf = float(confs_all[i]) if confs_all is not None and i < len(confs_all) else 0.0
                     if det_conf < conf_v:
                         continue
-                    raw = getattr(o, "xyxyxyxy", None)
-                    if raw is None:
-                        continue
-                    raw_pts = raw[0].detach().cpu().numpy().reshape(4, 2).tolist()
+                    cls_id = int(cls_all[i]) if cls_all is not None and i < len(cls_all) else 0
+                    raw_pts = polys_all[i].reshape(4, 2).tolist()
                     pts = clamp_polygon([(float(x), float(y)) for x, y in raw_pts], w, h)
                     if len(pts) < 4:
                         continue
@@ -1819,13 +1837,18 @@ class ModelRunner:
             self.last_parse_ms = (time.perf_counter() - t_parse0) * 1000.0
             self.last_total_predict_ms = self.last_backend_ms + self.last_parse_ms
             return detections
-        for b in boxes:
+        # Pull all axis-aligned boxes/confs/classes once instead of per detection.
+        xyxy_all = self._array_value(getattr(boxes, "xyxy", None))
+        confs_all = self._array_value(getattr(boxes, "conf", None))
+        cls_all = self._array_value(getattr(boxes, "cls", None))
+        n_box = int(xyxy_all.shape[0]) if xyxy_all is not None and xyxy_all.ndim >= 1 else 0
+        for i in range(n_box):
             try:
-                cls_id = int(self._scalar_value(getattr(b, "cls", [0]), 0))
-                det_conf = float(self._scalar_value(getattr(b, "conf", [0.0]), 0.0))
+                det_conf = float(confs_all[i]) if confs_all is not None and i < len(confs_all) else 0.0
                 if det_conf < conf_v:
                     continue
-                xyxy = b.xyxy[0].detach().cpu().numpy().astype(int).tolist()
+                cls_id = int(cls_all[i]) if cls_all is not None and i < len(cls_all) else 0
+                xyxy = xyxy_all[i].astype(int).tolist()
                 box = clamp_box(tuple(xyxy), w, h)
                 bw = max(0, box[2] - box[0]); bh = max(0, box[3] - box[1])
                 if bw <= 2 or bh <= 2 or bw * bh > w * h * 0.98:
@@ -5401,11 +5424,15 @@ class MainWindow(QMainWindow):
         self.camera_widget.set_frame(frame_for_display, overlay_result, seq=display_seq)
         self._record_preview_submit(display_seq)
         self._last_preview_update_t = now_loop
-        # PLC outputs remain live, but expensive QLabel/card refreshes do not
-        # need to run at 30 Hz. Throttling UI housekeeping reduces desktop
-        self.update_plc_outputs(self.last_result)
+        # PLC state submission and the expensive QLabel/card refreshes do not
+        # need to run at the full 30 Hz timer rate. The PLC writer is async with
+        # its own ~100 ms cadence and independent heartbeat, so submitting at
+        # 10 Hz here avoids rebuilding PLC config and pill text every tick while
+        # keeping outputs responsive. reset pulses are sent immediately via
+        # pulse_plc_reset() and held by the writer, so they cannot be missed.
         if now_loop - float(getattr(self, "_last_metrics_ui_update_t", 0.0) or 0.0) >= 0.10:
             self._last_metrics_ui_update_t = now_loop
+            self.update_plc_outputs(self.last_result)
             self.update_metrics(fps=self.fps)
             self.update_status_pills(self.last_result)
 
