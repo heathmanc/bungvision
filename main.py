@@ -37,7 +37,7 @@ import numpy as np
 from PySide6.QtCore import Qt, QTimer, QRect, QEvent
 from PySide6.QtGui import QAction, QColor, QFont, QImage, QPainter, QPen, QBrush, QPixmap, QIntValidator, QKeySequence, QShortcut
 from PySide6.QtWidgets import (
-    QApplication, QCheckBox, QComboBox, QDialog, QFileDialog, QFormLayout, QFrame,
+    QAbstractItemView, QApplication, QCheckBox, QComboBox, QDialog, QFileDialog, QFormLayout, QFrame,
     QGridLayout, QGroupBox, QHBoxLayout, QLabel, QLineEdit, QMainWindow,
     QMessageBox, QPushButton, QProxyStyle, QScrollArea, QSpinBox, QSizePolicy, QStatusBar, QStyle, QTabWidget, QTableWidget,
     QTableWidgetItem, QTextEdit, QVBoxLayout, QWidget
@@ -45,7 +45,7 @@ from PySide6.QtWidgets import (
 
 from camera_backend import BaslerPylonCamera, create_camera_backend, list_basler_cameras
 
-APP_TITLE = "BungVision Python Line-Side HMI v0.9.88 Inference Worker Cleanup"
+APP_TITLE = "BungVision Python Line-Side HMI v0.9.89 Production Summary Dashboard"
 ROOT = Path(__file__).resolve().parent
 LOG_DIR = ROOT / "logs"
 FAIL_DIR = ROOT / "fail_snapshots"
@@ -59,6 +59,9 @@ for d in (LOG_DIR, FAIL_DIR, PASS_DIR, TRAINING_REVIEW_DIR, CONFIG_DIR):
 DEBUG_LOG_FILE = LOG_DIR / "bungvision_debug.log"
 OUT_OF_BAND_STOP_FILE = ROOT / "runtime_stop.flag"
 OUT_OF_BAND_STOP_ACK_FILE = ROOT / "runtime_stop_ack.txt"
+# Persistent production history for the operator summary dashboard. Operational
+# record only; never read or written by the inference/grading/PLC/camera paths.
+PRODUCTION_SUMMARY_FILE = LOG_DIR / "production_summary.json"
 class VisibleCheckBoxStyle(QProxyStyle):
     """Draw a high-contrast checkbox indicator without stylesheet images.
 
@@ -484,6 +487,172 @@ class InspectionResult:
     detections: List[Detection]
     fps: float
     battery_grades: List[BatteryGrade]
+
+
+class ProductionStats:
+    """Persistent aggregate production history for the operator dashboard.
+
+    This is an operational reporting record only. It is updated at the single
+    battery commit point (the same place pass/fail/total counters increment)
+    and never participates in inference, grading, tracking, PLC, or camera
+    behavior. In-memory updates are immediate; the tiny JSON write is small and
+    infrequent (once per committed physical battery) and is queued to the save
+    worker by the caller so the live inspection path is never paused.
+
+    History is kept as per-day rollups so a "today" / "last 7 days" view and a
+    by-hour throughput view survive HMI restarts and shift changes.
+    """
+
+    SCHEMA_VERSION = 1
+    MAX_DAYS = 180
+
+    def __init__(self, path: Path):
+        self.path = Path(path)
+        self._lock = threading.Lock()
+        self._days: Dict[str, Dict[str, Any]] = {}
+
+    @staticmethod
+    def _empty_day() -> Dict[str, Any]:
+        return {
+            "total": 0,
+            "pass": 0,
+            "fail": 0,
+            "first_ts": "",
+            "last_ts": "",
+            "fail_categories": {},
+            "hours": {},
+        }
+
+    def load(self) -> None:
+        """Load history from disk. A missing or corrupt file starts fresh."""
+        try:
+            if not self.path.exists():
+                return
+            data = json.loads(self.path.read_text(encoding="utf-8"))
+            days = data.get("days", {}) if isinstance(data, dict) else {}
+            clean: Dict[str, Dict[str, Any]] = {}
+            for date_key, day in (days or {}).items():
+                if not isinstance(day, dict):
+                    continue
+                entry = self._empty_day()
+                entry["total"] = int(day.get("total", 0) or 0)
+                entry["pass"] = int(day.get("pass", 0) or 0)
+                entry["fail"] = int(day.get("fail", 0) or 0)
+                entry["first_ts"] = str(day.get("first_ts", "") or "")
+                entry["last_ts"] = str(day.get("last_ts", "") or "")
+                fc = day.get("fail_categories", {})
+                if isinstance(fc, dict):
+                    entry["fail_categories"] = {str(k): int(v or 0) for k, v in fc.items()}
+                hrs = day.get("hours", {})
+                if isinstance(hrs, dict):
+                    for hk, hv in hrs.items():
+                        if isinstance(hv, dict):
+                            entry["hours"][str(hk)] = {
+                                "total": int(hv.get("total", 0) or 0),
+                                "pass": int(hv.get("pass", 0) or 0),
+                                "fail": int(hv.get("fail", 0) or 0),
+                            }
+                clean[str(date_key)] = entry
+            with self._lock:
+                self._days = clean
+        except Exception:
+            # Never let a damaged history file stop the HMI from starting.
+            with self._lock:
+                self._days = {}
+
+    def record(self, status: str, category: str = "", when: Optional["dt.datetime"] = None) -> None:
+        """Record one committed PASS/FAIL result. Ignores non-terminal states."""
+        status = str(status or "").upper()
+        if status not in ("PASS", "FAIL"):
+            return
+        when = when or dt.datetime.now()
+        date_key = when.strftime("%Y-%m-%d")
+        hour_key = when.strftime("%H")
+        ts = when.isoformat(timespec="seconds")
+        with self._lock:
+            day = self._days.get(date_key)
+            if day is None:
+                day = self._empty_day()
+                self._days[date_key] = day
+            day["total"] += 1
+            if not day["first_ts"]:
+                day["first_ts"] = ts
+            day["last_ts"] = ts
+            hour = day["hours"].get(hour_key)
+            if hour is None:
+                hour = {"total": 0, "pass": 0, "fail": 0}
+                day["hours"][hour_key] = hour
+            hour["total"] += 1
+            if status == "PASS":
+                day["pass"] += 1
+                hour["pass"] += 1
+            else:
+                day["fail"] += 1
+                hour["fail"] += 1
+                cat = str(category or "Other").strip() or "Other"
+                day["fail_categories"][cat] = int(day["fail_categories"].get(cat, 0)) + 1
+
+    def save(self) -> None:
+        """Persist history atomically. Safe to call from the save worker."""
+        try:
+            with self._lock:
+                # Bound the file size by keeping only the most recent days.
+                if len(self._days) > self.MAX_DAYS:
+                    for old in sorted(self._days.keys())[: -self.MAX_DAYS]:
+                        self._days.pop(old, None)
+                payload = {
+                    "version": self.SCHEMA_VERSION,
+                    "updated": dt.datetime.now().isoformat(timespec="seconds"),
+                    "days": json.loads(json.dumps(self._days)),
+                }
+            text = json.dumps(payload, indent=2)
+            self.path.parent.mkdir(parents=True, exist_ok=True)
+            tmp = self.path.with_suffix(self.path.suffix + ".tmp")
+            tmp.write_text(text, encoding="utf-8")
+            os.replace(str(tmp), str(self.path))
+        except Exception:
+            pass
+
+    def day_summary(self, date_key: str) -> Dict[str, Any]:
+        with self._lock:
+            day = self._days.get(date_key)
+            if day is None:
+                return self._empty_day()
+            return json.loads(json.dumps(day))
+
+    def recent_days(self, n: int = 7) -> List[Tuple[str, Dict[str, Any]]]:
+        with self._lock:
+            keys = sorted(self._days.keys(), reverse=True)[: max(1, int(n))]
+            return [(k, json.loads(json.dumps(self._days[k]))) for k in keys]
+
+    def all_fail_categories(self) -> List[str]:
+        cats: set = set()
+        with self._lock:
+            for day in self._days.values():
+                cats.update(day.get("fail_categories", {}).keys())
+        return sorted(cats)
+
+    def export_csv(self, path: Path) -> None:
+        cats = self.all_fail_categories()
+        with self._lock:
+            keys = sorted(self._days.keys(), reverse=True)
+            rows: List[list] = []
+            for k in keys:
+                day = self._days[k]
+                total = int(day.get("total", 0) or 0)
+                passed = int(day.get("pass", 0) or 0)
+                failed = int(day.get("fail", 0) or 0)
+                rate = (100.0 * passed / total) if total else 0.0
+                fc = day.get("fail_categories", {})
+                row = [k, total, passed, failed, f"{rate:.1f}", day.get("first_ts", ""), day.get("last_ts", "")]
+                row += [int(fc.get(c, 0) or 0) for c in cats]
+                rows.append(row)
+        header = ["date", "total", "pass", "fail", "pass_rate_percent", "first_ts", "last_ts"] + [f"fail_{c}" for c in cats]
+        with Path(path).open("w", newline="") as f:
+            w = csv.writer(f)
+            w.writerow(header)
+            w.writerows(rows)
+
 
 PLC_TAG_DEFAULTS = {
     "running": (
@@ -2944,6 +3113,263 @@ class SettingsDialog(QDialog):
         self.parent_hmi.load_model()
 
 
+class ProductionDashboardDialog(QDialog):
+    """Read-only production summary for operators and supervisors.
+
+    Aggregates committed PASS/FAIL results for the current session (since the
+    last Reset Counts, which maps to a shift when reset at shift start), for
+    today, for the last seven days, and by reject reason and hour. This is a
+    pure reporting view: it reads the live counters and the persistent
+    ProductionStats history and never changes inspection, grading, or PLC
+    behavior.
+    """
+
+    REFRESH_MS = 2000
+
+    def __init__(self, parent: "MainWindow"):
+        super().__init__(parent)
+        self.hmi = parent
+        self.setWindowTitle("BungVision Production Summary")
+        self.setMinimumSize(720, 660)
+        self._build_ui()
+        self.refresh()
+        # Live-refresh while open so a supervisor can leave it up during a run.
+        self._timer = QTimer(self)
+        self._timer.timeout.connect(self.refresh)
+        self._timer.start(self.REFRESH_MS)
+
+    # ---- construction helpers -------------------------------------------------
+    def _metric_card(self, title: str, tone: str = "neutral") -> MetricCard:
+        return MetricCard(title, "--", "", tone)
+
+    def _make_table(self, headers: List[str], max_height: int = 200) -> QTableWidget:
+        table = QTableWidget(0, len(headers))
+        table.setHorizontalHeaderLabels(headers)
+        table.verticalHeader().setVisible(False)
+        table.setAlternatingRowColors(True)
+        table.setSelectionMode(QAbstractItemView.NoSelection)
+        table.setEditTriggers(QAbstractItemView.NoEditTriggers)
+        table.setFocusPolicy(Qt.NoFocus)
+        table.setMaximumHeight(max_height)
+        header = table.horizontalHeader()
+        try:
+            header.setStretchLastSection(True)
+        except Exception:
+            pass
+        return table
+
+    def _group(self, title: str) -> Tuple[QGroupBox, QVBoxLayout]:
+        box = QGroupBox(title)
+        lay = QVBoxLayout(box)
+        lay.setContentsMargins(8, 10, 8, 8)
+        lay.setSpacing(6)
+        return box, lay
+
+    def _build_ui(self):
+        outer = QVBoxLayout(self)
+        outer.setContentsMargins(12, 12, 12, 12)
+        outer.setSpacing(10)
+
+        content = QWidget()
+        root = QVBoxLayout(content)
+        root.setContentsMargins(0, 0, 0, 0)
+        root.setSpacing(10)
+
+        # Current session (since last Reset Counts).
+        sess_box, sess_lay = self._group("Current Session (since last Reset Counts)")
+        sgrid = QGridLayout()
+        self.sess_total = self._metric_card("PARTS", "info")
+        self.sess_pass = self._metric_card("PASS", "pass")
+        self.sess_fail = self._metric_card("REJECTS", "fail")
+        self.sess_rate = self._metric_card("PASS RATE", "info")
+        sgrid.addWidget(self.sess_total, 0, 0)
+        sgrid.addWidget(self.sess_pass, 0, 1)
+        sgrid.addWidget(self.sess_fail, 0, 2)
+        sgrid.addWidget(self.sess_rate, 0, 3)
+        sess_lay.addLayout(sgrid)
+        self.sess_meta = QLabel("")
+        self.sess_meta.setStyleSheet("color:#94a3b8; font-size:12px; font-weight:700;")
+        sess_lay.addWidget(self.sess_meta)
+        root.addWidget(sess_box)
+
+        # Today (all sessions on this calendar day).
+        today_box, today_lay = self._group("Today")
+        tgrid = QGridLayout()
+        self.today_total = self._metric_card("PARTS", "info")
+        self.today_pass = self._metric_card("PASS", "pass")
+        self.today_fail = self._metric_card("REJECTS", "fail")
+        self.today_rate = self._metric_card("PASS RATE", "info")
+        tgrid.addWidget(self.today_total, 0, 0)
+        tgrid.addWidget(self.today_pass, 0, 1)
+        tgrid.addWidget(self.today_fail, 0, 2)
+        tgrid.addWidget(self.today_rate, 0, 3)
+        today_lay.addLayout(tgrid)
+        root.addWidget(today_box)
+
+        # Today's reject breakdown by reason.
+        fail_box, fail_lay = self._group("Today — Reject Breakdown")
+        self.fail_table = self._make_table(["Reject Reason", "Count", "% of Rejects"], max_height=170)
+        fail_lay.addWidget(self.fail_table)
+        root.addWidget(fail_box)
+
+        # Last seven days trend.
+        trend_box, trend_lay = self._group("Last 7 Days")
+        self.trend_table = self._make_table(["Date", "Parts", "PASS", "Rejects", "Pass Rate"], max_height=220)
+        trend_lay.addWidget(self.trend_table)
+        root.addWidget(trend_box)
+
+        # Today by hour.
+        hour_box, hour_lay = self._group("Today — By Hour")
+        self.hour_table = self._make_table(["Hour", "Parts", "PASS", "Rejects"], max_height=220)
+        hour_lay.addWidget(self.hour_table)
+        root.addWidget(hour_box)
+        root.addStretch(1)
+
+        scroll = QScrollArea()
+        scroll.setWidgetResizable(True)
+        scroll.setWidget(content)
+        outer.addWidget(scroll, 1)
+
+        btns = QHBoxLayout()
+        refresh_btn = QPushButton("Refresh")
+        refresh_btn.clicked.connect(lambda _checked=False: self.refresh())
+        export_btn = QPushButton("Export CSV")
+        export_btn.clicked.connect(lambda _checked=False: self.export_csv())
+        open_logs_btn = QPushButton("Open Logs Folder")
+        open_logs_btn.clicked.connect(lambda _checked=False: self.hmi.open_folder(LOG_DIR))
+        close_btn = QPushButton("Close")
+        close_btn.clicked.connect(self.accept)
+        btns.addWidget(refresh_btn)
+        btns.addWidget(export_btn)
+        btns.addWidget(open_logs_btn)
+        btns.addStretch(1)
+        btns.addWidget(close_btn)
+        outer.addLayout(btns)
+
+    # ---- formatting helpers ---------------------------------------------------
+    @staticmethod
+    def _rate_text(passed: int, total: int) -> str:
+        if total <= 0:
+            return "--"
+        return f"{100.0 * passed / total:.1f}%"
+
+    @staticmethod
+    def _rate_sub(passed: int, total: int) -> str:
+        if total <= 0:
+            return "no parts yet"
+        return f"{passed}/{total} PASS"
+
+    @staticmethod
+    def _fmt_duration(delta: "dt.timedelta") -> str:
+        secs = max(0, int(delta.total_seconds()))
+        hours, rem = divmod(secs, 3600)
+        mins, _ = divmod(rem, 60)
+        if hours:
+            return f"{hours}h {mins:02d}m"
+        return f"{mins}m"
+
+    def _add_row(self, table: QTableWidget, values: List[str]) -> None:
+        r = table.rowCount()
+        table.insertRow(r)
+        for c, value in enumerate(values):
+            item = QTableWidgetItem(str(value))
+            item.setFlags(item.flags() & ~Qt.ItemIsEditable)
+            table.setItem(r, c, item)
+
+    # ---- refresh / actions ----------------------------------------------------
+    def refresh(self):
+        hmi = self.hmi
+        stats = getattr(hmi, "production_stats", None)
+
+        # Current session uses the live counters that the commit path maintains.
+        s_total = int(getattr(hmi, "total_count", 0) or 0)
+        s_pass = int(getattr(hmi, "pass_count", 0) or 0)
+        s_fail = int(getattr(hmi, "fail_count", 0) or 0)
+        self.sess_total.set_value(str(s_total), "committed")
+        self.sess_pass.set_value(str(s_pass), "PASS")
+        self.sess_fail.set_value(str(s_fail), "FAIL")
+        self.sess_rate.set_value(self._rate_text(s_pass, s_total), self._rate_sub(s_pass, s_total))
+
+        start = getattr(hmi, "session_start_t", None)
+        if start is not None:
+            now = dt.datetime.now()
+            duration = now - start
+            hours = max(duration.total_seconds() / 3600.0, 0.0)
+            pph = (s_total / hours) if hours > 0 else 0.0
+            self.sess_meta.setText(
+                f"Since {start.strftime('%Y-%m-%d %H:%M')}  •  {self._fmt_duration(duration)} elapsed  •  {pph:.0f} parts/hr"
+            )
+        else:
+            self.sess_meta.setText("")
+
+        if stats is None:
+            return
+
+        today_key = dt.datetime.now().strftime("%Y-%m-%d")
+        day = stats.day_summary(today_key)
+        t_total = int(day.get("total", 0) or 0)
+        t_pass = int(day.get("pass", 0) or 0)
+        t_fail = int(day.get("fail", 0) or 0)
+        self.today_total.set_value(str(t_total), "all sessions")
+        self.today_pass.set_value(str(t_pass), "PASS")
+        self.today_fail.set_value(str(t_fail), "FAIL")
+        self.today_rate.set_value(self._rate_text(t_pass, t_total), self._rate_sub(t_pass, t_total))
+
+        # Reject breakdown (today).
+        self.fail_table.setRowCount(0)
+        categories = sorted(day.get("fail_categories", {}).items(), key=lambda kv: kv[1], reverse=True)
+        if categories:
+            for cat, count in categories:
+                pct = (100.0 * int(count) / t_fail) if t_fail else 0.0
+                self._add_row(self.fail_table, [cat, str(int(count)), f"{pct:.0f}%"])
+        else:
+            self._add_row(self.fail_table, ["No rejects today", "0", "--"])
+
+        # Last seven days.
+        self.trend_table.setRowCount(0)
+        recent = stats.recent_days(7)
+        if recent:
+            for date_key, d in recent:
+                d_total = int(d.get("total", 0) or 0)
+                d_pass = int(d.get("pass", 0) or 0)
+                d_fail = int(d.get("fail", 0) or 0)
+                self._add_row(
+                    self.trend_table,
+                    [date_key, str(d_total), str(d_pass), str(d_fail), self._rate_text(d_pass, d_total)],
+                )
+        else:
+            self._add_row(self.trend_table, ["No data yet", "0", "0", "0", "--"])
+
+        # Today by hour.
+        self.hour_table.setRowCount(0)
+        hours_map = day.get("hours", {})
+        if hours_map:
+            for hk in sorted(hours_map.keys()):
+                hv = hours_map[hk]
+                self._add_row(
+                    self.hour_table,
+                    [f"{hk}:00", str(int(hv.get("total", 0) or 0)), str(int(hv.get("pass", 0) or 0)), str(int(hv.get("fail", 0) or 0))],
+                )
+        else:
+            self._add_row(self.hour_table, ["No data yet", "0", "0", "0"])
+
+    def export_csv(self):
+        stats = getattr(self.hmi, "production_stats", None)
+        if stats is None:
+            QMessageBox.warning(self, "Export Production Summary", "No production history is available.")
+            return
+        default = str(LOG_DIR / f"production_summary_{dt.datetime.now().strftime('%Y%m%d_%H%M%S')}.csv")
+        path, _ = QFileDialog.getSaveFileName(self, "Export Production Summary", default, "CSV Files (*.csv)")
+        if not path:
+            return
+        try:
+            stats.export_csv(Path(path))
+            self.hmi.log(f"Exported production summary to {path}")
+            QMessageBox.information(self, "Export Production Summary", f"Saved:\n{path}")
+        except Exception as exc:
+            QMessageBox.warning(self, "Export Production Summary", f"Could not export production summary:\n{exc}")
+
+
 class MainWindow(QMainWindow):
     def __init__(self):
         super().__init__()
@@ -3001,6 +3427,14 @@ class MainWindow(QMainWindow):
         self.pass_count = 0
         self.fail_count = 0
         self.last_logged_status = None
+
+        # Persistent production history for the operator summary dashboard.
+        # Operational reporting only; not part of inference/grading/PLC. The
+        # session start time tracks the current shift when the operator presses
+        # Reset Counts at shift start.
+        self.session_start_t = dt.datetime.now()
+        self.production_stats = ProductionStats(PRODUCTION_SUMMARY_FILE)
+        self.production_stats.load()
 
         # Latched machine-control reject state. This is separate from counters.
         self.reject_latched = False
@@ -3275,6 +3709,9 @@ class MainWindow(QMainWindow):
         self.reset_reject_btn.clicked.connect(lambda _checked=False: self.reset_reject_latch())
         self.reset_btn = QPushButton("Reset Counts")
         self.reset_btn.clicked.connect(lambda _checked=False: self.reset_counts())
+        self.summary_btn = QPushButton("Production Summary")
+        self.summary_btn.setToolTip("Open the read-only production summary: session, today, last 7 days, reject breakdown, and by-hour throughput.")
+        self.summary_btn.clicked.connect(lambda _checked=False: self.open_production_dashboard())
         self.bypass_check = QCheckBox("Bypass (Supervisor)")
         self.bypass_check.setToolTip("Supervisor-only bypass. Bypass inhibits vision stop/alarm requests, but does not make the PLC Ready bit true.")
         self.bypass_check.clicked.connect(lambda checked=False: self.on_bypass_changed(bool(checked)))
@@ -3285,7 +3722,8 @@ class MainWindow(QMainWindow):
         cg.addWidget(self.settings_btn, 1, 1)
         cg.addWidget(self.reset_reject_btn, 2, 0)
         cg.addWidget(self.reset_btn, 2, 1)
-        cg.addWidget(self.bypass_check, 3, 0, 1, 2)
+        cg.addWidget(self.summary_btn, 3, 0, 1, 2)
+        cg.addWidget(self.bypass_check, 4, 0, 1, 2)
         side.addWidget(controls)
 
         overlay_box = QGroupBox("Camera Overlay")
@@ -4428,6 +4866,10 @@ class MainWindow(QMainWindow):
         self.fail_count = 0
         self.last_logged_status = None
 
+        # Start a fresh session window for the production dashboard. Historical
+        # per-day totals in production_stats are intentionally preserved.
+        self.session_start_t = dt.datetime.now()
+
         # Latched machine-control reject state. This is separate from counters.
         self.reject_latched = False
         self.reject_latch_id = 0
@@ -5051,6 +5493,33 @@ class MainWindow(QMainWindow):
         except Exception:
             self.log("Training-review capture failed:\n" + traceback.format_exc())
 
+    def _fail_category(self, grade: BatteryGrade) -> str:
+        """Bucket a committed reject into a coarse reason for the dashboard.
+
+        Derived from the grade fields rather than the free-text reason so the
+        breakdown stays stable across reason-string wording changes.
+        """
+        if grade.status != "FAIL":
+            return ""
+        try:
+            if grade.pattern_ok is False:
+                return "Pattern invalid"
+            if int(grade.bung_count) < int(grade.expected_bungs):
+                return "Missing bungs"
+            if int(grade.bung_count) > int(grade.expected_bungs):
+                return "Extra bungs"
+        except Exception:
+            pass
+        return "Other"
+
+    def open_production_dashboard(self):
+        try:
+            dlg = ProductionDashboardDialog(self)
+            dlg.exec()
+        except Exception as exc:
+            self.log(f"Could not open production summary: {exc}")
+            QMessageBox.warning(self, "Production Summary", f"Could not open production summary:\n{exc}")
+
     def commit_battery_grade(self, internal_tid: int, grade: BatteryGrade, result: InspectionResult, frame: np.ndarray) -> bool:
         """Commit exactly one PASS/FAIL result for one tracked physical battery.
 
@@ -5100,6 +5569,19 @@ class MainWindow(QMainWindow):
         self.update_metrics()
 
         self.add_history_row_for_grade(grade, result)
+
+        # Production summary (operator dashboard). The in-memory aggregate is
+        # updated immediately so the live counters and the dashboard agree; the
+        # tiny JSON persist is queued to the save worker like the image/record
+        # I/O below so it can never pause live inspection or PLC updates.
+        try:
+            self.production_stats.record(grade.status, self._fail_category(grade))
+            if hasattr(self, "save_worker") and self.save_worker is not None:
+                self.save_worker.enqueue(self.production_stats.save)
+            else:
+                self.production_stats.save()
+        except Exception:
+            pass
 
         # Disk I/O is intentionally queued after the counter commits so high-resolution
         # JPG/JSON writes cannot pause live inspection or PLC updates.
@@ -6131,6 +6613,14 @@ class MainWindow(QMainWindow):
         if hasattr(self, "save_settings"):
             try:
                 self.save_settings(silent=True)
+            except Exception:
+                pass
+
+        # Persist the production summary synchronously here: a save queued to the
+        # save worker by the final commit may not run once the worker is stopped.
+        if getattr(self, "production_stats", None) is not None:
+            try:
+                self.production_stats.save()
             except Exception:
                 pass
 
