@@ -1,6 +1,13 @@
-# BungVision Python HMI v0.9.82 - Badge Location Fix
+# BungVision Python HMI v0.9.83 - Inference Warmup & Preview Cache
 
-Baseline: v0.9.81 Menu/Bypass Fix, based on the v0.9.74 out-of-band stop watchdog production foundation.
+Baseline: v0.9.82 Badge Location Fix, based on the v0.9.74 out-of-band stop watchdog production foundation.
+
+## Changes in v0.9.83
+
+- Warm up the model on the operator's selected device/image size during the background load ("Loading...") so the inference backend is initialized once instead of re-initializing on the first live frame. This removes the apparent "model loads twice" behavior and the first-frame stall at run start.
+- Cache the operator preview pixmap so a held frame is not re-scaled/re-encoded on the Qt UI thread every timer tick during the overlay-sync hold window, improving UI responsiveness.
+- Updated the title bar / footer revision string to reflect this build.
+- Visual/runtime-housekeeping change only; no grading, tracking, PLC, camera, TensorRT, model, or image-size behavior was changed.
 
 ## Changes in v0.9.82
 
