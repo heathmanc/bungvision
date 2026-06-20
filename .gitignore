@@ -5,6 +5,9 @@ __pycache__/
 *.pyd
 .venv/
 lib/
+lib64
+config/
+bin/
 lib64/
 logs/
 venv/
