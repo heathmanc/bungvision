@@ -37,8 +37,8 @@ import numpy as np
 from PySide6.QtCore import Qt, QTimer, QRect, QEvent
 from PySide6.QtGui import QAction, QColor, QFont, QImage, QPainter, QPen, QBrush, QPixmap, QIntValidator, QKeySequence, QShortcut
 from PySide6.QtWidgets import (
-    QAbstractItemView, QApplication, QCheckBox, QComboBox, QDialog, QFileDialog, QFormLayout, QFrame,
-    QGridLayout, QGroupBox, QHBoxLayout, QLabel, QLineEdit, QMainWindow,
+    QAbstractItemView, QApplication, QCheckBox, QComboBox, QDialog, QDialogButtonBox, QFileDialog, QFormLayout, QFrame,
+    QGridLayout, QGroupBox, QHBoxLayout, QLabel, QLineEdit, QListWidget, QMainWindow,
     QMessageBox, QPushButton, QProxyStyle, QScrollArea, QSpinBox, QSizePolicy, QStatusBar, QStyle, QTabWidget, QTableWidget,
     QTableWidgetItem, QTextEdit, QVBoxLayout, QWidget
 )
