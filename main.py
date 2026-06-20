@@ -39,13 +39,13 @@ from PySide6.QtGui import QAction, QColor, QFont, QImage, QPainter, QPen, QBrush
 from PySide6.QtWidgets import (
     QAbstractItemView, QApplication, QCheckBox, QComboBox, QDialog, QDialogButtonBox, QFileDialog, QFormLayout, QFrame,
     QGridLayout, QGroupBox, QHBoxLayout, QLabel, QLineEdit, QListWidget, QMainWindow,
-    QMessageBox, QPushButton, QProxyStyle, QScrollArea, QSpinBox, QSizePolicy, QStatusBar, QStyle, QTabWidget, QTableWidget,
+    QMessageBox, QPushButton, QProxyStyle, QScrollArea, QSpinBox, QSizePolicy, QSplitter, QStatusBar, QStyle, QTabWidget, QTableWidget,
     QTableWidgetItem, QTextEdit, QVBoxLayout, QWidget
 )
 
 from camera_backend import BaslerPylonCamera, create_camera_backend, list_basler_cameras
 
-APP_TITLE = "BungVision Python Line-Side HMI v0.9.90 Custom Reject Classes"
+APP_TITLE = "BungVision Python Line-Side HMI v0.9.91 Resizable Preview"
 ROOT = Path(__file__).resolve().parent
 LOG_DIR = ROOT / "logs"
 FAIL_DIR = ROOT / "fail_snapshots"
@@ -3723,9 +3723,13 @@ class MainWindow(QMainWindow):
         h.addWidget(self.mode_pill)
         main.addWidget(header)
 
-        body = QGridLayout()
-        body.setSpacing(8)
-        left = QVBoxLayout()
+        self.preview_splitter = QSplitter(Qt.Horizontal)
+        self.preview_splitter.setChildrenCollapsible(False)
+        left_widget = QWidget()
+        left = QVBoxLayout(left_widget)
+        left.setContentsMargins(0, 0, 0, 0)
+        left.setSpacing(8)
+        side_widget = QWidget()
 
         self.decision_frame = QFrame()
         self.decision_frame.setObjectName("DecisionFrame")
@@ -3748,9 +3752,8 @@ class MainWindow(QMainWindow):
         self.camera_widget = CameraWidget()
         self.camera_widget.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Expanding)
         left.addWidget(self.camera_widget, 1)
-        body.addLayout(left, 0, 0, 2, 10)
 
-        side = QVBoxLayout()
+        side = QVBoxLayout(side_widget)
         metric_grid = QGridLayout()
         self.pass_rate_card = MetricCard("PASS RATE", "--", "no inspections", "neutral")
         self.reject_card = MetricCard("REJECTS", "0", "current session", "fail")
@@ -3846,6 +3849,11 @@ class MainWindow(QMainWindow):
         self.bypass_check = QCheckBox("Bypass (Supervisor)")
         self.bypass_check.setToolTip("Supervisor-only bypass. Bypass inhibits vision stop/alarm requests, but does not make the PLC Ready bit true.")
         self.bypass_check.clicked.connect(lambda checked=False: self.on_bypass_changed(bool(checked)))
+        preview_size_label = QLabel("Preview Size:")
+        self.preview_size_combo = QComboBox()
+        self.preview_size_combo.addItems(["3/4", "Full", "1/2", "1/4"])
+        self.preview_size_combo.setToolTip("Set the camera preview width as a fraction of the window width.")
+        self.preview_size_combo.currentTextChanged.connect(self._apply_preview_size)
 
         cg.addWidget(self.open_btn, 0, 0)
         cg.addWidget(self.close_btn, 0, 1)
@@ -3856,6 +3864,8 @@ class MainWindow(QMainWindow):
         cg.addWidget(self.summary_btn, 3, 0, 1, 2)
         cg.addWidget(self.reject_classes_btn, 4, 0, 1, 2)
         cg.addWidget(self.bypass_check, 5, 0, 1, 2)
+        cg.addWidget(preview_size_label, 6, 0)
+        cg.addWidget(self.preview_size_combo, 6, 1)
         side.addWidget(controls)
 
         overlay_box = QGroupBox("Camera Overlay")
@@ -3925,8 +3935,11 @@ class MainWindow(QMainWindow):
         self.table.setAlternatingRowColors(True)
         self.table.hide()
         side.addStretch(1)
-        body.addLayout(side, 0, 10, 2, 2)
-        main.addLayout(body, 1)
+        self.preview_splitter.addWidget(left_widget)
+        self.preview_splitter.addWidget(side_widget)
+        self.preview_splitter.setStretchFactor(0, 3)
+        self.preview_splitter.setStretchFactor(1, 1)
+        main.addWidget(self.preview_splitter, 1)
 
         # Hidden backing log: keep log() calls and export/debug routines safe without
         # consuming operator-screen real estate.
@@ -4044,6 +4057,7 @@ class MainWindow(QMainWindow):
             "plc_heartbeat_interval_ms": int(getattr(self, "plc_heartbeat_interval_ms", 500)),
             "plc_tags": {key: edit.text().strip() for key, edit in getattr(self, "plc_tag_edits", {}).items()},
             "custom_reject_classes": list(getattr(self, "custom_reject_classes", [])),
+            "preview_size": self.preview_size_combo.currentText() if hasattr(self, "preview_size_combo") else "3/4",
         }
 
     def save_settings(self, silent: bool = False):
@@ -4161,6 +4175,13 @@ class MainWindow(QMainWindow):
             else:
                 self.custom_reject_classes = []
 
+            preview_size = str(data.get("preview_size", "3/4")).strip()
+            if hasattr(self, "preview_size_combo"):
+                idx = self.preview_size_combo.findText(preview_size)
+                if idx >= 0:
+                    self.preview_size_combo.setCurrentIndex(idx)
+                self._apply_preview_size(self.preview_size_combo.currentText())
+
             self.apply_runtime_settings()
             self.log(f"Settings loaded from {SETTINGS_FILE}; bypass forced OFF at startup.")
             return True
@@ -4191,6 +4212,21 @@ class MainWindow(QMainWindow):
             return bool(widget.isChecked())
         except Exception:
             return default
+
+    def _apply_preview_size(self, text: str = ""):
+        """Adjust the camera/side splitter ratio based on the preview size selection."""
+        if not hasattr(self, "preview_splitter"):
+            return
+        fracs = {"full": 1.0, "3/4": 0.75, "1/2": 0.50, "1/4": 0.25}
+        frac = fracs.get(text.strip().lower(), 0.75)
+        total = self.preview_splitter.width()
+        if total < 100:
+            # Widget not yet shown — defer until it's visible.
+            QTimer.singleShot(50, lambda: self._apply_preview_size(text))
+            return
+        cam_w = max(100, int(total * frac))
+        side_w = max(0, total - cam_w)
+        self.preview_splitter.setSizes([cam_w, side_w])
 
     def on_overlay_control_changed(self):
         if hasattr(self, "camera_widget"):
