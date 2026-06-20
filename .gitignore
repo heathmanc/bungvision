@@ -21,7 +21,7 @@ pass_snapshots/
 fail_snapshots/
 runtime_stop.flag
 runtime_stop_ack.txt
-
+pyvenv.cfs
 # Models / engines - usually too large for normal git
 *.pt
 *.onnx
