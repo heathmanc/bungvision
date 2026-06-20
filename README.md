@@ -1,6 +1,14 @@
-# BungVision Python HMI v0.9.87 - Overlay Pixmap Cache
+# BungVision Python HMI v0.9.88 - Inference Worker Cleanup
 
-Baseline: v0.9.86 Pull-Based Inference Loop, based on the v0.9.74 out-of-band stop watchdog production foundation.
+Baseline: v0.9.87 Overlay Pixmap Cache, based on the v0.9.74 out-of-band stop watchdog production foundation.
+
+## Changes in v0.9.88
+
+- Removed the dead push-based inference API that the v0.9.86 pull-based loop made obsolete. Deleted `InferenceWorker.submit_frame()`, `can_accept()`, `_take_pending()`, and `clear_pending_if_stale()`, along with the `_pending` slot and `_submit_t` timestamp they used. The worker now has a single scheduling path: `_next_input_packet()` pulls the newest camera frame on its own thread.
+- Dropped the now-meaningless `pending` / `pending_age_ms` inference metrics (the pending slot no longer exists). The stall watchdog and operator-stop diagnostics now report only the live `busy` / `busy_age_ms` state of an in-flight prediction.
+- Replaced the two `clear_pending_if_stale(0.0)` flush calls in the operator-stop and out-of-band stop paths with `set_enabled(False)`, which is the correct way to halt the pull-based worker.
+- Removed two write-only `MainWindow` fields (`_last_inference_submit_t`, `_last_preview_update_t`) that were assigned every tick but never read.
+- Cleanup only; no inference scheduling, grading, tracking, PLC, camera, TensorRT, model, or image-size behavior changed.
 
 ## Changes in v0.9.87
 

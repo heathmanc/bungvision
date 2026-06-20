@@ -45,7 +45,7 @@ from PySide6.QtWidgets import (
 
 from camera_backend import BaslerPylonCamera, create_camera_backend, list_basler_cameras
 
-APP_TITLE = "BungVision Python Line-Side HMI v0.9.87 Overlay Pixmap Cache"
+APP_TITLE = "BungVision Python Line-Side HMI v0.9.88 Inference Worker Cleanup"
 ROOT = Path(__file__).resolve().parent
 LOG_DIR = ROOT / "logs"
 FAIL_DIR = ROOT / "fail_snapshots"
@@ -2111,7 +2111,6 @@ class InferenceWorker:
         self._event = threading.Event()
         self._stop = threading.Event()
         self._thread: Optional[threading.Thread] = None
-        self._pending: Optional[CameraFramePacket] = None
         self._latest: Optional[InferencePacket] = None
         # Pull-based scheduling: the worker fetches the newest camera frame
         # itself via this source callback as soon as it finishes a prediction,
@@ -2143,9 +2142,8 @@ class InferenceWorker:
         self._parse_ms = 0.0
         self._done_count = 0
         # Stall diagnostics. These do not alter normal inference speed; they let
-        # the HMI identify when a queued/busy inference job is blocking fresh
-        # results long enough to make the operator display look frozen.
-        self._submit_t = 0.0
+        # the HMI identify when a running inference job is blocking fresh results
+        # long enough to make the operator display look frozen.
         self._busy_start_t = 0.0
         self._current_seq = 0
 
@@ -2166,7 +2164,6 @@ class InferenceWorker:
 
     def clear(self) -> None:
         with self._lock:
-            self._pending = None
             self._latest = None
             self._last_error = ""
             self._dropped = 0
@@ -2176,7 +2173,6 @@ class InferenceWorker:
             self._idle_ms = 0.0
             self._backend_ms = 0.0
             self._parse_ms = 0.0
-            self._submit_t = 0.0
             self._busy_start_t = 0.0
             self._current_seq = 0
             self._last_input_seq = 0
@@ -2210,31 +2206,6 @@ class InferenceWorker:
             self._preview_w = max(0, int(preview_w))
             self._preview_h = max(0, int(preview_h))
 
-    def can_accept(self) -> bool:
-        """True when no frame is queued and YOLO is not currently predicting.
-
-        v0.9.31 replaced the pending inference frame every timer tick while
-        prediction was busy. That produced high dropped-frame counts and jitter
-        on Jetson because preprocessing/postprocessing competed with capture and
-        display continuously. v0.9.32 only accepts one frame when the worker is
-        genuinely ready; the UI then submits the newest camera frame after the
-        prior prediction completes.
-        """
-        with self._lock:
-            return self._pending is None and not self._busy
-
-    def submit_frame(self, packet: CameraFramePacket) -> bool:
-        if packet is None or packet.frame is None:
-            return False
-        with self._lock:
-            if self._pending is not None or self._busy:
-                self._skipped_busy += 1
-                return False
-            self._pending = packet
-            self._submit_t = time.perf_counter()
-        self._event.set()
-        return True
-
     def get_latest(self) -> Optional[InferencePacket]:
         with self._lock:
             return self._latest
@@ -2257,43 +2228,10 @@ class InferenceWorker:
                 "done_count": float(self._done_count),
                 "skipped_busy": float(self._skipped_busy),
                 "dropped": float(self._dropped),
-                "pending": 1.0 if self._pending is not None else 0.0,
                 "busy": 1.0 if self._busy else 0.0,
-                "pending_age_ms": ((time.perf_counter() - self._submit_t) * 1000.0) if self._pending is not None and self._submit_t > 0 else 0.0,
                 "busy_age_ms": ((time.perf_counter() - self._busy_start_t) * 1000.0) if self._busy and self._busy_start_t > 0 else 0.0,
                 "current_seq": float(self._current_seq),
             }
-
-    def clear_pending_if_stale(self, max_age_ms: float) -> Optional[int]:
-        """Drop a queued frame if it has not started inference in time.
-
-        This only clears the not-yet-running pending slot. It never attempts to
-        interrupt a running YOLO/TensorRT call, which would be unsafe.
-        """
-        now = time.perf_counter()
-        with self._lock:
-            if self._pending is None or self._busy or self._submit_t <= 0:
-                return None
-            age_ms = (now - self._submit_t) * 1000.0
-            if age_ms < float(max_age_ms):
-                return None
-            seq = int(getattr(self._pending, "seq", 0) or 0)
-            self._pending = None
-            self._submit_t = 0.0
-            self._dropped += 1
-            self._event.clear()
-            return seq
-
-    def _take_pending(self) -> Optional[CameraFramePacket]:
-        with self._lock:
-            packet = self._pending
-            self._pending = None
-            self._event.clear()
-            if packet is not None:
-                self._busy = True
-                self._busy_start_t = time.perf_counter()
-                self._current_seq = int(getattr(packet, "seq", 0) or 0)
-            return packet
 
     def _next_input_packet(self) -> Optional[CameraFramePacket]:
         """Pull the newest source frame if it has not been inferred yet.
@@ -3142,8 +3080,6 @@ class MainWindow(QMainWindow):
         self._last_result_seq = 0
         self._last_displayed_seq = 0
         self._last_inference_result_t = 0.0
-        self._last_inference_submit_t = 0.0
-        self._last_preview_update_t = 0.0
         self._last_profiler_log_t = time.perf_counter()
         self._prof_last_cam_seq = 0
         self._prof_last_preview_total = 0
@@ -4260,9 +4196,7 @@ class MainWindow(QMainWindow):
             f"model_loaded={getattr(self.model_runner, 'model', None) is not None} "
             f"cam_seq={cam_seq} "
             f"inf_busy={bool(inf_metrics.get('busy', 0.0))} "
-            f"inf_pending={bool(inf_metrics.get('pending', 0.0))} "
-            f"busy_age_ms={float(inf_metrics.get('busy_age_ms', 0.0) or 0.0):.0f} "
-            f"pending_age_ms={float(inf_metrics.get('pending_age_ms', 0.0) or 0.0):.0f}"
+            f"busy_age_ms={float(inf_metrics.get('busy_age_ms', 0.0) or 0.0):.0f}"
         )
 
     def request_operator_stop(self, source: str = "button"):
@@ -4296,7 +4230,7 @@ class MainWindow(QMainWindow):
         self._last_prediction_error = "Operator stop requested."
         try:
             if getattr(self, "inference_worker", None) is not None:
-                self.inference_worker.clear_pending_if_stale(0.0)
+                self.inference_worker.set_enabled(False)
         except Exception:
             pass
         try:
@@ -4366,7 +4300,7 @@ class MainWindow(QMainWindow):
                 self._external_stop_requested = True
                 try:
                     if getattr(self, "inference_worker", None) is not None:
-                        self.inference_worker.clear_pending_if_stale(0.0)
+                        self.inference_worker.set_enabled(False)
                 except Exception:
                     pass
                 try:
@@ -5502,31 +5436,17 @@ class MainWindow(QMainWindow):
                 self.inference_idle_ms = float(inf_metrics.get("idle_ms", 0.0) or 0.0)
                 self.inference_backend_ms = float(inf_metrics.get("backend_ms", 0.0) or 0.0)
                 self.inference_parse_ms = float(inf_metrics.get("parse_ms", 0.0) or 0.0)
-                # Inference stall watchdog: do not let a stale not-yet-running
-                # pending frame block fresh frame submission forever, and log
-                # when a running TensorRT call takes long enough to explain an
-                # operator-visible freeze. This is a rescue/diagnostic layer only;
-                # it does not kill a running TensorRT call.
+                # Inference stall watchdog: log when a running TensorRT call takes
+                # long enough to explain an operator-visible freeze. This is a
+                # diagnostic layer only; it does not kill a running TensorRT call.
                 try:
                     max_stall_ms = float(getattr(self, "inference_stall_watchdog_ms", 1500.0) or 1500.0)
-                    pending_age_ms = float(inf_metrics.get("pending_age_ms", 0.0) or 0.0)
                     busy_age_ms = float(inf_metrics.get("busy_age_ms", 0.0) or 0.0)
-                    busy_now = bool(inf_metrics.get("busy", 0.0) or 0.0)
-                    pending_now = bool(inf_metrics.get("pending", 0.0) or 0.0)
-                    dropped_seq = None
-                    if pending_now and not busy_now and pending_age_ms >= max_stall_ms:
-                        try:
-                            dropped_seq = self.inference_worker.clear_pending_if_stale(max_stall_ms)
-                        except Exception:
-                            dropped_seq = None
                     now_stall_log = now_loop
-                    if (busy_age_ms >= max_stall_ms or dropped_seq is not None) and now_stall_log - float(getattr(self, "_last_inference_stall_log_t", 0.0) or 0.0) > 1.0:
+                    if busy_age_ms >= max_stall_ms and now_stall_log - float(getattr(self, "_last_inference_stall_log_t", 0.0) or 0.0) > 1.0:
                         self._last_inference_stall_log_t = now_stall_log
                         current_seq = int(inf_metrics.get("current_seq", 0.0) or 0)
-                        if dropped_seq is not None:
-                            self.log(f"INFER_STALL dropped stale pending frame seq={dropped_seq} age_ms={pending_age_ms:.0f} latest_cam_seq={latest_cam_seq}")
-                        else:
-                            self.log(f"INFER_STALL active inference seq={current_seq} busy_age_ms={busy_age_ms:.0f} latest_cam_seq={latest_cam_seq}; showing live camera until result returns")
+                        self.log(f"INFER_STALL active inference seq={current_seq} busy_age_ms={busy_age_ms:.0f} latest_cam_seq={latest_cam_seq}; showing live camera until result returns")
                 except Exception:
                     pass
             except Exception:
@@ -5615,7 +5535,6 @@ class MainWindow(QMainWindow):
         # timer tick that has a frame available.
         self.camera_widget.set_frame(frame_for_display, overlay_result, seq=display_seq, preview_rgb=preview_for_display)
         self._record_preview_submit(display_seq)
-        self._last_preview_update_t = now_loop
         # PLC state submission and the expensive QLabel/card refreshes do not
         # need to run at the full 30 Hz timer rate. The PLC writer is async with
         # its own ~100 ms cadence and independent heartbeat, so submitting at
