@@ -1,6 +1,14 @@
-# BungVision Python HMI v0.9.85 - Off-Thread Preview Scaling
+# BungVision Python HMI v0.9.86 - Pull-Based Inference Loop
 
-Baseline: v0.9.84 Inference Parse & PLC Throttle, based on the v0.9.74 out-of-band stop watchdog production foundation.
+Baseline: v0.9.85 Off-Thread Preview Scaling, based on the v0.9.74 out-of-band stop watchdog production foundation.
+
+## Changes in v0.9.86
+
+- Decoupled inference scheduling from the 30 Hz UI timer. The inference worker now pulls the newest camera frame on its own thread as soon as it finishes a prediction, instead of waiting for the UI timer to push one. This removes up to one UI-tick (~30 ms) of idle time between predictions and improves inference throughput and result freshness, especially when inference is faster than the timer.
+- The UI thread now only enables/disables the worker (based on running + model-loaded state) and reads the latest result for display; it no longer hands frames to the worker each tick.
+- Preserved latest-frame semantics (no frame backlog), skipped-frame accounting, the busy/stall diagnostics, and the stale-result guard. A freshly opened camera resets the worker's last-inferred sequence so its restarted counter is not mistaken for already-seen frames.
+- Demo mode and operator Stop disable the worker and detach the frame source so it does not pull from a stopped or synthetic source.
+- Scheduling change only; detection outputs, grading, tracking, PLC, camera, TensorRT, model, and image-size behavior are unchanged.
 
 ## Changes in v0.9.85
 
