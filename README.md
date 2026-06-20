@@ -1,6 +1,13 @@
-# BungVision Python HMI v0.9.83 - Inference Warmup & Preview Cache
+# BungVision Python HMI v0.9.84 - Inference Parse & PLC Throttle
 
-Baseline: v0.9.82 Badge Location Fix, based on the v0.9.74 out-of-band stop watchdog production foundation.
+Baseline: v0.9.83 Inference Warmup & Preview Cache, based on the v0.9.74 out-of-band stop watchdog production foundation.
+
+## Changes in v0.9.84
+
+- Parse YOLO results by pulling all boxes/confidences/classes from each result in a single CPU transfer instead of one `.detach().cpu().numpy()` per detection. This removes repeated GPU->CPU syncs in the inference parse step for both OBB and detect outputs.
+- Removed a redundant `QImage.copy()` in the preview pixmap build; `QPixmap.fromImage()` already copies the pixels, so the extra buffer copy was wasted work each preview update.
+- Throttled PLC output submission and operator card/pill refreshes to ~10 Hz instead of the full 30 Hz UI timer rate. The PLC writer remains async with its own cadence and heartbeat, and reset pulses are still sent immediately and latched by the writer.
+- Parsing/throttling change only; detection outputs, grading, tracking, PLC tag semantics, camera, TensorRT, model, and image-size behavior are unchanged.
 
 ## Changes in v0.9.83
 
