@@ -1848,19 +1848,24 @@ class Pill(QLabel):
 class MetricCard(QFrame):
     def __init__(self, title: str, value: str, sub: str = "", tone: str = "neutral"):
         super().__init__()
+        # Name the frame so the border/background rule below targets only the
+        # card itself. A plain "QFrame {...}" rule would cascade onto the child
+        # QLabels (a QLabel is a QFrame) and box every line of text.
+        self.setObjectName("MetricCard")
         self.title = QLabel(title)
         self.value = QLabel(value)
         self.sub = QLabel(sub)
-        self.title.setStyleSheet("color:#94a3b8; font-size:11px; font-weight:800; letter-spacing:1px;")
-        self.value.setStyleSheet("color:white; font-size:21px; font-weight:900;")
-        self.sub.setStyleSheet("color:#64748b; font-size:12px;")
+        self.title.setStyleSheet("color:#94a3b8; font-size:11px; font-weight:800; letter-spacing:1px; background:transparent; border:none;")
+        self.value.setStyleSheet("color:white; font-size:21px; font-weight:900; background:transparent; border:none;")
+        self.sub.setStyleSheet("color:#64748b; font-size:12px; background:transparent; border:none;")
         layout = QVBoxLayout(self)
-        layout.setContentsMargins(10, 6, 10, 6)
+        layout.setContentsMargins(12, 8, 12, 8)
+        layout.setSpacing(2)
         layout.addWidget(self.title)
         layout.addWidget(self.value)
         layout.addWidget(self.sub)
         border = {"pass": "#10b981", "fail": "#ef4444", "warn": "#f59e0b", "info": "#38bdf8", "neutral": "#334155"}.get(tone, "#334155")
-        self.setStyleSheet(f"QFrame {{ background:#0f172a; border:1px solid {border}; border-radius:18px; }}")
+        self.setStyleSheet(f"QFrame#MetricCard {{ background:#0f172a; border:1px solid {border}; border-radius:18px; }}")
 
     def set_value(self, value: str, sub: str = ""):
         self.value.setText(value)
@@ -3142,21 +3147,42 @@ class ProductionDashboardDialog(QDialog):
     def _metric_card(self, title: str, tone: str = "neutral") -> MetricCard:
         return MetricCard(title, "--", "", tone)
 
-    def _make_table(self, headers: List[str], max_height: int = 200) -> QTableWidget:
+    def _make_table(self, headers: List[str], cap_height: int = 300) -> QTableWidget:
         table = QTableWidget(0, len(headers))
         table.setHorizontalHeaderLabels(headers)
         table.verticalHeader().setVisible(False)
+        table.verticalHeader().setDefaultSectionSize(30)
         table.setAlternatingRowColors(True)
         table.setSelectionMode(QAbstractItemView.NoSelection)
         table.setEditTriggers(QAbstractItemView.NoEditTriggers)
         table.setFocusPolicy(Qt.NoFocus)
-        table.setMaximumHeight(max_height)
+        table.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
+        # The inherited theme leaves alternate rows a pale default, which renders
+        # as faint, low-contrast text. Pin a dark alternate color and bright text.
+        table.setStyleSheet(
+            "QTableWidget { background:#0b1220; alternate-background-color:#111c33; color:#e2e8f0; gridline-color:#1e293b; border:1px solid #334155; border-radius:12px; }"
+            "QTableWidget::item { color:#e2e8f0; padding:3px 8px; }"
+            "QHeaderView::section { background:#1e293b; color:#cbd5e1; border:none; padding:6px; font-weight:800; }"
+        )
+        table._cap_height = int(cap_height)
         header = table.horizontalHeader()
         try:
             header.setStretchLastSection(True)
         except Exception:
             pass
         return table
+
+    def _fit_table_height(self, table: QTableWidget) -> None:
+        """Size a populated table to its rows so nothing is clipped or overlapped.
+
+        Height is capped so a long table scrolls internally instead of dominating
+        the dialog; the surrounding scroll area handles any remaining overflow.
+        """
+        header_h = table.horizontalHeader().height() or table.horizontalHeader().sizeHint().height()
+        rows_h = sum(table.rowHeight(r) for r in range(table.rowCount()))
+        total = header_h + rows_h + 2 * table.frameWidth() + 2
+        cap = int(getattr(table, "_cap_height", 300))
+        table.setFixedHeight(max(60, min(total, cap)))
 
     def _group(self, title: str) -> Tuple[QGroupBox, QVBoxLayout]:
         box = QGroupBox(title)
@@ -3208,19 +3234,19 @@ class ProductionDashboardDialog(QDialog):
 
         # Today's reject breakdown by reason.
         fail_box, fail_lay = self._group("Today — Reject Breakdown")
-        self.fail_table = self._make_table(["Reject Reason", "Count", "% of Rejects"], max_height=170)
+        self.fail_table = self._make_table(["Reject Reason", "Count", "% of Rejects"], cap_height=260)
         fail_lay.addWidget(self.fail_table)
         root.addWidget(fail_box)
 
         # Last seven days trend.
         trend_box, trend_lay = self._group("Last 7 Days")
-        self.trend_table = self._make_table(["Date", "Parts", "PASS", "Rejects", "Pass Rate"], max_height=220)
+        self.trend_table = self._make_table(["Date", "Parts", "PASS", "Rejects", "Pass Rate"], cap_height=320)
         trend_lay.addWidget(self.trend_table)
         root.addWidget(trend_box)
 
         # Today by hour.
         hour_box, hour_lay = self._group("Today — By Hour")
-        self.hour_table = self._make_table(["Hour", "Parts", "PASS", "Rejects"], max_height=220)
+        self.hour_table = self._make_table(["Hour", "Parts", "PASS", "Rejects"], cap_height=320)
         hour_lay.addWidget(self.hour_table)
         root.addWidget(hour_box)
         root.addStretch(1)
@@ -3324,6 +3350,7 @@ class ProductionDashboardDialog(QDialog):
                 self._add_row(self.fail_table, [cat, str(int(count)), f"{pct:.0f}%"])
         else:
             self._add_row(self.fail_table, ["No rejects today", "0", "--"])
+        self._fit_table_height(self.fail_table)
 
         # Last seven days.
         self.trend_table.setRowCount(0)
@@ -3339,6 +3366,7 @@ class ProductionDashboardDialog(QDialog):
                 )
         else:
             self._add_row(self.trend_table, ["No data yet", "0", "0", "0", "--"])
+        self._fit_table_height(self.trend_table)
 
         # Today by hour.
         self.hour_table.setRowCount(0)
@@ -3352,6 +3380,7 @@ class ProductionDashboardDialog(QDialog):
                 )
         else:
             self._add_row(self.hour_table, ["No data yet", "0", "0", "0"])
+        self._fit_table_height(self.hour_table)
 
     def export_csv(self):
         stats = getattr(self.hmi, "production_stats", None)
