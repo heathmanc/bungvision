@@ -11,6 +11,7 @@ bin/
 lib64/
 logs/
 venv/
+share/
 env/
 bungvision_env/
 
