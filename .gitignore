@@ -1,0 +1,30 @@
+# Python
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.venv/
+lib/
+lib64/
+logs/
+venv/
+env/
+bungvision_env/
+
+# Runtime files
+logs/
+pass_snapshots/
+fail_snapshots/
+runtime_stop.flag
+runtime_stop_ack.txt
+
+# Models / engines - usually too large for normal git
+*.pt
+*.onnx
+*.engine
+
+# OS/editor
+.DS_Store
+Thumbs.db
+.vscode/
+.idea/

@@ -1,0 +1,8 @@
+PySide6>=6.6
+opencv-python
+numpy
+ultralytics
+# Optional for native Basler camera support:
+# pypylon
+# Optional for Allen-Bradley / CompactLogix PLC support:
+# pylogix
