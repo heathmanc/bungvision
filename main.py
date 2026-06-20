@@ -45,7 +45,7 @@ from PySide6.QtWidgets import (
 
 from camera_backend import BaslerPylonCamera, create_camera_backend, list_basler_cameras
 
-APP_TITLE = "BungVision Python Line-Side HMI v0.9.86 Pull-Based Inference Loop"
+APP_TITLE = "BungVision Python Line-Side HMI v0.9.87 Overlay Pixmap Cache"
 ROOT = Path(__file__).resolve().parent
 LOG_DIR = ROOT / "logs"
 FAIL_DIR = ROOT / "fail_snapshots"
@@ -1254,6 +1254,14 @@ class CameraWidget(QWidget):
         self._preview_content_size: Tuple[int, int] = (0, 0)
         self._preview_source_shape: Tuple[int, int] = (0, 0)
         self._preview_render_size: Tuple[int, int] = (0, 0)
+        # Overlay pixmap cache: the detection/badge drawing loops are expensive
+        # Python work that produces identical output every repaint while the
+        # inference result is stable. Pre-render it once into a transparent
+        # QPixmap keyed on (result_id, target_w, target_h); paintEvent composites
+        # it with a single drawPixmap instead of re-running the loops each time.
+        self._overlay_pixmap: Optional[QPixmap] = None
+        self._overlay_result_id: int = 0
+        self._overlay_target_key: Tuple[int, int] = (0, 0)
         self.setStyleSheet("background:#020617; border-radius:18px;")
 
     def set_overlay_options(
@@ -1269,6 +1277,7 @@ class CameraWidget(QWidget):
         self.show_detection_labels = bool(labels)
         self.show_grade_badges = bool(grades)
         self.show_fail_banner = bool(fail_banner)
+        self._overlay_result_id = 0  # invalidate overlay cache
         self.update()
 
     def set_frame(self, frame_bgr: Optional[np.ndarray], result: Optional[InspectionResult], seq: Optional[int] = None, preview_rgb: Optional[np.ndarray] = None) -> None:
@@ -1437,6 +1446,144 @@ class CameraWidget(QWidget):
         except Exception:
             return {"paint_fps": 0.0, "paint_ms": 0.0, "qimage_ms": 0.0, "scale_ms": 0.0, "overlay_ms": 0.0}
 
+    def _build_overlay_pixmap(self, target: "QRect") -> "QPixmap":
+        """Render detection boxes, labels, and grade badges into a transparent QPixmap.
+
+        Coordinates are target-relative so the caller can drawPixmap(target, pixmap)
+        without any further offset. Rebuilds only when the result or target size changes.
+        """
+        tw, th = target.width(), target.height()
+        pix = QPixmap(tw, th)
+        pix.fill(Qt.transparent)
+        if self.result is None or self.frame_bgr is None:
+            return pix
+        p2 = QPainter(pix)
+        try:
+            p2.setRenderHint(QPainter.Antialiasing)
+            h, w = self.frame_bgr.shape[:2]
+            sx = tw / max(1, w)
+            sy = th / max(1, h)
+
+            if self.show_detection_boxes or self.show_detection_labels:
+                for det in self.result.detections:
+                    x1, y1, x2, y2 = det.box
+                    rx1 = int(x1 * sx)
+                    ry1 = int(y1 * sy)
+                    rx2 = int(x2 * sx)
+                    ry2 = int(y2 * sy)
+                    kind = detection_kind(det.label)
+                    if kind == "battery":
+                        color, width_pen = QColor("#38bdf8"), 4
+                    elif kind == "bung":
+                        color, width_pen = QColor("#22c55e"), 3
+                    elif kind == "retainer":
+                        color, width_pen = QColor("#f59e0b"), 2
+                    else:
+                        color, width_pen = QColor("#94a3b8"), 2
+                    draw_pts = []
+                    if getattr(det, "obb_points", None):
+                        draw_pts = [(int(px * sx), int(py * sy)) for px, py in (det.obb_points or [])]
+                    if self.show_detection_boxes:
+                        p2.setPen(QPen(color, width_pen))
+                        if len(draw_pts) >= 3:
+                            for i in range(len(draw_pts)):
+                                x_a, y_a = draw_pts[i]
+                                x_b, y_b = draw_pts[(i + 1) % len(draw_pts)]
+                                p2.drawLine(x_a, y_a, x_b, y_b)
+                        else:
+                            p2.drawRoundedRect(QRect(rx1, ry1, rx2 - rx1, ry2 - ry1), 8, 8)
+                    if self.show_detection_labels:
+                        label = f"{det.label} {det.conf:.2f}"
+                        if getattr(det, "obb_points", None):
+                            label += " OBB"
+                        p2.setFont(QFont("Arial", 10, QFont.Bold))
+                        tw_lbl = p2.fontMetrics().horizontalAdvance(label) + 12
+                        lx = min([p0 for p0, _ in draw_pts], default=rx1)
+                        ly = min([p1 for _, p1 in draw_pts], default=ry1)
+                        p2.fillRect(QRect(lx, max(0, ly - 24), tw_lbl, 22), QColor(2, 6, 23, 210))
+                        p2.setPen(color)
+                        p2.drawText(lx + 6, max(16, ly - 8), label)
+
+            if self.show_grade_badges:
+                for grade in getattr(self.result, "battery_grades", []):
+                    x1, y1, x2, y2 = grade.box
+                    rx1 = int(x1 * sx)
+                    ry1 = int(y1 * sy)
+                    rx2 = int(x2 * sx)
+                    ry2 = int(y2 * sy)
+                    ok = grade.status == "PASS"
+                    waiting = grade.status == "WAIT"
+                    color = QColor("#22c55e") if ok else (QColor("#f59e0b") if waiting else QColor("#ef4444"))
+                    bg = QColor(6, 78, 59, 220) if ok else (QColor(120, 53, 15, 225) if waiting else QColor(127, 29, 29, 230))
+                    p2.setPen(QPen(color, 5))
+                    grade_pts = []
+                    if getattr(grade, "obb_points", None):
+                        grade_pts = [(int(px * sx), int(py * sy)) for px, py in (grade.obb_points or [])]
+                    if len(grade_pts) >= 3:
+                        for i in range(len(grade_pts)):
+                            x_a, y_a = grade_pts[i]
+                            x_b, y_b = grade_pts[(i + 1) % len(grade_pts)]
+                            p2.drawLine(x_a, y_a, x_b, y_b)
+                    else:
+                        p2.drawRoundedRect(QRect(rx1, ry1, rx2 - rx1, ry2 - ry1), 10, 10)
+                    id_text = f"ID {grade.track_id}" if grade.track_id > 0 else "CAND"
+                    line1 = f"{id_text}  {grade.status}"
+                    line2 = f"{grade.bung_count}/{grade.expected_bungs}"
+
+                    bx1 = min([p0 for p0, _ in grade_pts], default=rx1)
+                    by1 = min([p1 for _, p1 in grade_pts], default=ry1)
+                    bx2 = max([p0 for p0, _ in grade_pts], default=rx2)
+                    by2 = max([p1 for _, p1 in grade_pts], default=ry2)
+
+                    font1 = QFont("Arial", 11, QFont.Bold)
+                    font2 = QFont("Arial", 10, QFont.Bold)
+                    p2.setFont(font1)
+                    fm1 = p2.fontMetrics()
+                    line1_w = fm1.horizontalAdvance(line1)
+                    line1_h = fm1.height()
+                    p2.setFont(font2)
+                    fm2 = p2.fontMetrics()
+                    line2_w = fm2.horizontalAdvance(line2)
+                    line2_h = fm2.height()
+
+                    badge_w = max(line1_w, line2_w) + 18
+                    badge_h = line1_h + line2_h + 10
+                    preferred_x = bx1 + 8
+                    preferred_y = by1 + 8
+                    max_x_inside_battery = bx2 - badge_w - 6
+                    max_y_inside_battery = by2 - badge_h - 6
+                    if max_x_inside_battery >= bx1 + 4:
+                        badge_x = max(bx1 + 4, min(preferred_x, max_x_inside_battery))
+                    else:
+                        badge_x = preferred_x
+                    if max_y_inside_battery >= by1 + 4:
+                        badge_y = max(by1 + 4, min(preferred_y, max_y_inside_battery))
+                    else:
+                        badge_y = preferred_y
+
+                    badge_x = max(4, min(badge_x, tw - badge_w - 4))
+                    badge_y = max(38, min(badge_y, th - badge_h - 4))
+
+                    badge_rect = QRect(int(badge_x), int(badge_y), int(badge_w), int(badge_h))
+                    p2.fillRect(badge_rect, bg)
+                    p2.setPen(QPen(color, 2))
+                    p2.drawRoundedRect(badge_rect, 5, 5)
+                    p2.setPen(QColor("#ffffff"))
+                    p2.setFont(font1)
+                    p2.drawText(badge_rect.x() + 9, badge_rect.y() + line1_h, line1)
+                    p2.setFont(font2)
+                    p2.drawText(badge_rect.x() + 9, badge_rect.y() + line1_h + line2_h + 3, line2)
+
+            if self.show_fail_banner and self.result.status == "FAIL":
+                msg = self.result.reason
+                p2.fillRect(QRect(20, th - 72, tw - 40, 52), QColor(127, 29, 29, 225))
+                p2.setPen(QColor("#fecaca"))
+                p2.setFont(QFont("Arial", 18, QFont.Bold))
+                p2.drawText(QRect(34, th - 66, tw - 68, 42), Qt.AlignVCenter, f"FAIL: {msg}")
+        finally:
+            p2.end()
+        return pix
+
     def paintEvent(self, event):
         paint_start = time.perf_counter()
         overlay_start = 0.0
@@ -1490,133 +1637,18 @@ class CameraWidget(QWidget):
                 return
 
             overlay_start = time.perf_counter()
-            h, w = self.frame_bgr.shape[:2]
-            sx = target.width() / max(1, w)
-            sy = target.height() / max(1, h)
-
-            if self.show_detection_boxes or self.show_detection_labels:
-                for det in self.result.detections:
-                    x1, y1, x2, y2 = det.box
-                    rx1 = int(target.x() + x1 * sx)
-                    ry1 = int(target.y() + y1 * sy)
-                    rx2 = int(target.x() + x2 * sx)
-                    ry2 = int(target.y() + y2 * sy)
-                    kind = detection_kind(det.label)
-                    if kind == "battery":
-                        color, width_pen = QColor("#38bdf8"), 4
-                    elif kind == "bung":
-                        color, width_pen = QColor("#22c55e"), 3
-                    elif kind == "retainer":
-                        color, width_pen = QColor("#f59e0b"), 2
-                    else:
-                        color, width_pen = QColor("#94a3b8"), 2
-                    draw_pts = []
-                    if getattr(det, "obb_points", None):
-                        draw_pts = [(int(target.x() + px * sx), int(target.y() + py * sy)) for px, py in (det.obb_points or [])]
-                    if self.show_detection_boxes:
-                        p.setPen(QPen(color, width_pen))
-                        if len(draw_pts) >= 3:
-                            for i in range(len(draw_pts)):
-                                x_a, y_a = draw_pts[i]
-                                x_b, y_b = draw_pts[(i + 1) % len(draw_pts)]
-                                p.drawLine(x_a, y_a, x_b, y_b)
-                        else:
-                            p.drawRoundedRect(QRect(rx1, ry1, rx2 - rx1, ry2 - ry1), 8, 8)
-                    if self.show_detection_labels:
-                        label = f"{det.label} {det.conf:.2f}"
-                        if getattr(det, "obb_points", None):
-                            label += " OBB"
-                        p.setFont(QFont("Arial", 10, QFont.Bold))
-                        tw = p.fontMetrics().horizontalAdvance(label) + 12
-                        lx = min([p0 for p0, _ in draw_pts], default=rx1)
-                        ly = min([p1 for _, p1 in draw_pts], default=ry1)
-                        p.fillRect(QRect(lx, max(target.y(), ly - 24), tw, 22), QColor(2, 6, 23, 210))
-                        p.setPen(color)
-                        p.drawText(lx + 6, max(target.y() + 16, ly - 8), label)
-
-            if self.show_grade_badges:
-                for grade in getattr(self.result, "battery_grades", []):
-                    x1, y1, x2, y2 = grade.box
-                    rx1 = int(target.x() + x1 * sx)
-                    ry1 = int(target.y() + y1 * sy)
-                    rx2 = int(target.x() + x2 * sx)
-                    ry2 = int(target.y() + y2 * sy)
-                    ok = grade.status == "PASS"
-                    waiting = grade.status == "WAIT"
-                    color = QColor("#22c55e") if ok else (QColor("#f59e0b") if waiting else QColor("#ef4444"))
-                    bg = QColor(6, 78, 59, 220) if ok else (QColor(120, 53, 15, 225) if waiting else QColor(127, 29, 29, 230))
-                    p.setPen(QPen(color, 5))
-                    grade_pts = []
-                    if getattr(grade, "obb_points", None):
-                        grade_pts = [(int(target.x() + px * sx), int(target.y() + py * sy)) for px, py in (grade.obb_points or [])]
-                    if len(grade_pts) >= 3:
-                        for i in range(len(grade_pts)):
-                            x_a, y_a = grade_pts[i]
-                            x_b, y_b = grade_pts[(i + 1) % len(grade_pts)]
-                            p.drawLine(x_a, y_a, x_b, y_b)
-                    else:
-                        p.drawRoundedRect(QRect(rx1, ry1, rx2 - rx1, ry2 - ry1), 10, 10)
-                    id_text = f"ID {grade.track_id}" if grade.track_id > 0 else "CAND"
-                    line1 = f"{id_text}  {grade.status}"
-                    line2 = f"{grade.bung_count}/{grade.expected_bungs}"
-
-                    # Keep the PASS/FAIL badge attached to the battery it belongs to.
-                    # Older builds placed this below the battery footprint; with multiple
-                    # batteries in view that could clamp to the screen edge and appear far
-                    # from the actual battery.  Anchor it inside the battery's displayed
-                    # OBB/box bounds instead.
-                    bx1 = min([p0 for p0, _ in grade_pts], default=rx1)
-                    by1 = min([p1 for _, p1 in grade_pts], default=ry1)
-                    bx2 = max([p0 for p0, _ in grade_pts], default=rx2)
-                    by2 = max([p1 for _, p1 in grade_pts], default=ry2)
-
-                    font1 = QFont("Arial", 11, QFont.Bold)
-                    font2 = QFont("Arial", 10, QFont.Bold)
-                    p.setFont(font1)
-                    fm1 = p.fontMetrics()
-                    line1_w = fm1.horizontalAdvance(line1)
-                    line1_h = fm1.height()
-                    p.setFont(font2)
-                    fm2 = p.fontMetrics()
-                    line2_w = fm2.horizontalAdvance(line2)
-                    line2_h = fm2.height()
-
-                    badge_w = max(line1_w, line2_w) + 18
-                    badge_h = line1_h + line2_h + 10
-                    preferred_x = bx1 + 8
-                    preferred_y = by1 + 8
-                    max_x_inside_battery = bx2 - badge_w - 6
-                    max_y_inside_battery = by2 - badge_h - 6
-                    if max_x_inside_battery >= bx1 + 4:
-                        badge_x = max(bx1 + 4, min(preferred_x, max_x_inside_battery))
-                    else:
-                        badge_x = preferred_x
-                    if max_y_inside_battery >= by1 + 4:
-                        badge_y = max(by1 + 4, min(preferred_y, max_y_inside_battery))
-                    else:
-                        badge_y = preferred_y
-
-                    # Final preview clamp prevents the badge from disappearing if the
-                    # battery is partly at an edge, while still keeping it near that battery.
-                    badge_x = max(target.x() + 4, min(badge_x, target.right() - badge_w - 4))
-                    badge_y = max(target.y() + 38, min(badge_y, target.bottom() - badge_h - 4))
-
-                    badge_rect = QRect(int(badge_x), int(badge_y), int(badge_w), int(badge_h))
-                    p.fillRect(badge_rect, bg)
-                    p.setPen(QPen(color, 2))
-                    p.drawRoundedRect(badge_rect, 5, 5)
-                    p.setPen(QColor("#ffffff"))
-                    p.setFont(font1)
-                    p.drawText(badge_rect.x() + 9, badge_rect.y() + line1_h, line1)
-                    p.setFont(font2)
-                    p.drawText(badge_rect.x() + 9, badge_rect.y() + line1_h + line2_h + 3, line2)
-
-            if self.show_fail_banner and self.result.status == "FAIL":
-                msg = self.result.reason
-                p.fillRect(QRect(target.x() + 20, target.bottom() - 72, target.width() - 40, 52), QColor(127, 29, 29, 225))
-                p.setPen(QColor("#fecaca"))
-                p.setFont(QFont("Arial", 18, QFont.Bold))
-                p.drawText(QRect(target.x() + 34, target.bottom() - 66, target.width() - 68, 42), Qt.AlignVCenter, f"FAIL: {msg}")
+            # Use cached overlay pixmap when result and target size are unchanged.
+            # The Python coordinate loops only re-run when a new InspectionResult
+            # arrives or the display area is resized; every other repaint (OS
+            # expose, focus events, etc.) is just two drawPixmap calls.
+            overlay_key = (target.width(), target.height())
+            result_id = id(self.result)
+            if result_id != self._overlay_result_id or overlay_key != self._overlay_target_key:
+                self._overlay_pixmap = self._build_overlay_pixmap(target)
+                self._overlay_result_id = result_id
+                self._overlay_target_key = overlay_key
+            if self._overlay_pixmap is not None:
+                p.drawPixmap(target.x(), target.y(), self._overlay_pixmap)
         finally:
             try:
                 if overlay_start:
