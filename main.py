@@ -1215,6 +1215,13 @@ class CameraWidget(QWidget):
         self._scale_ms = 0.0
         self._overlay_ms = 0.0
         self._preview_pixmap: Optional[QPixmap] = None
+        # Identity of the frame the cached pixmap was built from. set_frame()
+        # is called on every UI timer tick, but during the overlay-sync hold
+        # window the same frame is re-submitted many times. These let set_frame()
+        # skip the expensive full-frame resize/QImage conversion when the
+        # underlying frame has not actually changed.
+        self._preview_seq: Optional[int] = None
+        self._preview_frame_id: int = 0
         self._preview_content_size: Tuple[int, int] = (0, 0)
         self._preview_source_shape: Tuple[int, int] = (0, 0)
         self._preview_render_size: Tuple[int, int] = (0, 0)
@@ -1235,10 +1242,27 @@ class CameraWidget(QWidget):
         self.show_fail_banner = bool(fail_banner)
         self.update()
 
-    def set_frame(self, frame_bgr: Optional[np.ndarray], result: Optional[InspectionResult]) -> None:
+    def set_frame(self, frame_bgr: Optional[np.ndarray], result: Optional[InspectionResult], seq: Optional[int] = None) -> None:
         self.frame_bgr = frame_bgr
         self.result = result
-        self._build_preview_pixmap()
+        # Rebuild the display pixmap only when the underlying frame actually
+        # changed. The UI timer re-submits the same held frame across many
+        # ticks during the overlay-sync hold window; without this guard a full
+        # cv2.resize + cvtColor + QImage conversion would run every tick on the
+        # Qt UI thread. Overlays/badges are drawn from self.result in
+        # paintEvent(), so a stable frame can safely reuse the cached pixmap.
+        # A widget resize is still handled lazily in paintEvent().
+        frame_id = id(frame_bgr) if frame_bgr is not None else 0
+        if (
+            frame_bgr is None
+            or self._preview_pixmap is None
+            or seq is None
+            or seq != self._preview_seq
+            or frame_id != self._preview_frame_id
+        ):
+            self._preview_seq = seq
+            self._preview_frame_id = frame_id
+            self._build_preview_pixmap()
         self.update()
 
     def _preview_target_size(self, frame_bgr: np.ndarray) -> Tuple[int, int, int, int]:
@@ -1582,6 +1606,7 @@ class ModelRunner:
         self.last_backend_ms = 0.0
         self.last_parse_ms = 0.0
         self.last_total_predict_ms = 0.0
+        self.last_warmup_ms = 0.0
 
     def _coerce_names_dict(self, names: Any) -> Dict[int, str]:
         """Return class names using only plain Python int keys."""
@@ -1631,7 +1656,7 @@ class ModelRunner:
             label = str(int(cls_id))
         return label
 
-    def load(self, model_path: str, task: str = "auto", class_names_override: str = "") -> str:
+    def load(self, model_path: str, task: str = "auto", class_names_override: str = "", device: str = "", imgsz: int = 0) -> str:
         """Load an Ultralytics model/engine with explicit task support.
 
         Plain .pt models normally load with YOLO(path). TensorRT engines may not
@@ -1672,7 +1697,31 @@ class ModelRunner:
                 self.task = "obb"
             _write_debug_log(f"MODEL_LOADED task={self.task!r} names={self.names!r}")
 
-        return f"Loaded model: {model_path}\nRequested Task: {self.requested_task}\nRuntime Task: {self.task}\nClasses: {self.names}"
+        # Warm up once on the target device while still on the background load
+        # thread. Ultralytics initializes its inference backend lazily on the
+        # first predict(); without this the model effectively initializes a
+        # second time on the first live frame (the operator-visible "loads
+        # twice" behavior, and a first-frame UI stall at run start). Doing it
+        # here pays that cost once, off the Qt UI thread, during "Loading...".
+        self.last_warmup_ms = 0.0
+        device = str(device or "").strip()
+        try:
+            warm_imgsz = int(imgsz) if int(imgsz or 0) > 0 else 736
+        except Exception:
+            warm_imgsz = 736
+        try:
+            dummy = np.zeros((warm_imgsz, warm_imgsz, 3), dtype=np.uint8)
+            t_warm0 = time.perf_counter()
+            self.predict(dummy, conf=0.25, iou=0.45, imgsz=warm_imgsz, device=device)
+            self.last_warmup_ms = (time.perf_counter() - t_warm0) * 1000.0
+            _write_debug_log(
+                f"MODEL_WARMUP ok device={device!r} imgsz={warm_imgsz} ms={self.last_warmup_ms:.1f}"
+            )
+        except Exception:
+            _write_debug_log("MODEL_WARMUP failed:\n" + traceback.format_exc())
+
+        warm_note = f"\nWarmup: {self.last_warmup_ms:.0f} ms (device={device or 'auto'})" if self.last_warmup_ms > 0 else ""
+        return f"Loaded model: {model_path}\nRequested Task: {self.requested_task}\nRuntime Task: {self.task}\nClasses: {self.names}{warm_note}"
 
     def _scalar_value(self, value: Any, default: float = 0.0) -> float:
         try:
@@ -3706,7 +3755,15 @@ class MainWindow(QMainWindow):
             self.log(f"Sanitizing non-string sys.argv entries before YOLO load: {bad_argv}")
         task = _normalize_model_task(getattr(self, "model_task", "auto"))
         class_names_override = str(getattr(self, "model_class_names_override", "")).strip()
-        self.log(f"MODEL_LOAD_REQUEST using YOLO(path) path={path!r}, task={task!r}, class_names_override={class_names_override!r}")
+        # Capture the operator's device/image-size so the background load can
+        # initialize and warm up the model on the real target device once,
+        # instead of paying that cost again on the first live inspection frame.
+        load_device = self.device_edit.text().strip() if hasattr(self, "device_edit") else ""
+        try:
+            load_imgsz = int(self.imgsz_spin.value()) if hasattr(self, "imgsz_spin") else 0
+        except Exception:
+            load_imgsz = 0
+        self.log(f"MODEL_LOAD_REQUEST using YOLO(path) path={path!r}, task={task!r}, class_names_override={class_names_override!r}, device={load_device!r}, imgsz={load_imgsz}")
         _write_debug_log(f"MODEL_LOAD_REQUEST path={path!r} task={task!r} class_override={class_names_override!r}")
 
         self._model_loading = True
@@ -3727,7 +3784,7 @@ class MainWindow(QMainWindow):
 
         def _worker():
             try:
-                msg = self.model_runner.load(path, task=task, class_names_override=class_names_override)
+                msg = self.model_runner.load(path, task=task, class_names_override=class_names_override, device=load_device, imgsz=load_imgsz)
                 self._model_load_queue.put(("ok", msg, ""), timeout=0.1)
             except Exception:
                 tb = traceback.format_exc()
@@ -5163,7 +5220,7 @@ class MainWindow(QMainWindow):
             self.last_frame = frame
             self.last_result = result
             self._last_result_seq = int(getattr(self, "_last_result_seq", 0) or 0) + 1
-            self.camera_widget.set_frame(frame, result)
+            self.camera_widget.set_frame(frame, result, seq=self._last_result_seq)
             self._record_preview_submit(self._last_result_seq)
             self.update_decision(result)
             self.update_metrics(fps=self.fps)
@@ -5341,7 +5398,7 @@ class MainWindow(QMainWindow):
 
         # v0.9.77: uncapped preview refresh. Update the camera widget on every UI
         # timer tick that has a frame available.
-        self.camera_widget.set_frame(frame_for_display, overlay_result)
+        self.camera_widget.set_frame(frame_for_display, overlay_result, seq=display_seq)
         self._record_preview_submit(display_seq)
         self._last_preview_update_t = now_loop
         # PLC outputs remain live, but expensive QLabel/card refreshes do not
