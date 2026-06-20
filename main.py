@@ -45,7 +45,7 @@ from PySide6.QtWidgets import (
 
 from camera_backend import BaslerPylonCamera, create_camera_backend, list_basler_cameras
 
-APP_TITLE = "BungVision Python Line-Side HMI v0.9.85 Off-Thread Preview Scaling"
+APP_TITLE = "BungVision Python Line-Side HMI v0.9.86 Pull-Based Inference Loop"
 ROOT = Path(__file__).resolve().parent
 LOG_DIR = ROOT / "logs"
 FAIL_DIR = ROOT / "fail_snapshots"
@@ -2081,6 +2081,16 @@ class InferenceWorker:
         self._thread: Optional[threading.Thread] = None
         self._pending: Optional[CameraFramePacket] = None
         self._latest: Optional[InferencePacket] = None
+        # Pull-based scheduling: the worker fetches the newest camera frame
+        # itself via this source callback as soon as it finishes a prediction,
+        # instead of waiting for the UI timer to push one (which inserted up to
+        # one UI-tick of idle time between inferences). _enabled mirrors the
+        # operator running/model-loaded state; _last_input_seq tracks the last
+        # camera frame actually inferred so newer frames are picked up and
+        # already-seen / duplicate frames are skipped.
+        self._frame_source = None
+        self._enabled = False
+        self._last_input_seq = 0
         self._conf = 0.25
         self._iou = 0.45
         self._imgsz = 736
@@ -2137,7 +2147,27 @@ class InferenceWorker:
             self._submit_t = 0.0
             self._busy_start_t = 0.0
             self._current_seq = 0
+            self._last_input_seq = 0
         self._event.clear()
+
+    def set_frame_source(self, source) -> None:
+        """Provide a callable returning the newest CameraFramePacket.
+
+        Setting (or replacing) the source resets the last-inferred sequence so a
+        freshly opened camera, whose sequence counter restarts at zero, is not
+        mistaken for already-seen frames.
+        """
+        with self._lock:
+            self._frame_source = source
+            self._last_input_seq = 0
+        self._event.set()
+
+    def set_enabled(self, enabled: bool) -> None:
+        """Allow/halt autonomous inference (mirrors running + model-loaded)."""
+        with self._lock:
+            self._enabled = bool(enabled)
+        if enabled:
+            self._event.set()
 
     def update_config(self, conf: float, iou: float, imgsz: int, device: str = "", preview_w: int = 0, preview_h: int = 0) -> None:
         with self._lock:
@@ -2233,20 +2263,50 @@ class InferenceWorker:
                 self._current_seq = int(getattr(packet, "seq", 0) or 0)
             return packet
 
+    def _next_input_packet(self) -> Optional[CameraFramePacket]:
+        """Pull the newest source frame if it has not been inferred yet.
+
+        Returns None when inference is disabled, no model/source is set, or the
+        newest frame was already processed. When it returns a packet it has
+        marked the worker busy and counted any camera frames skipped (never
+        inferred) since the previous prediction.
+        """
+        with self._lock:
+            enabled = self._enabled
+            source = self._frame_source
+        if not enabled or source is None:
+            return None
+        if getattr(self.model_runner, "model", None) is None:
+            return None
+        try:
+            packet = source()
+        except Exception:
+            packet = None
+        if packet is None or getattr(packet, "frame", None) is None:
+            return None
+        seq = int(getattr(packet, "seq", 0) or 0)
+        with self._lock:
+            if seq == self._last_input_seq:
+                return None
+            if self._last_input_seq > 0 and seq > self._last_input_seq + 1:
+                self._skipped_busy += (seq - self._last_input_seq - 1)
+            self._last_input_seq = seq
+            self._busy = True
+            self._busy_start_t = time.perf_counter()
+            self._current_seq = seq
+        return packet
+
     def _run(self) -> None:
         while not self._stop.is_set():
-            self._event.wait(0.05)
-            if self._stop.is_set():
-                break
-            packet = self._take_pending()
+            packet = self._next_input_packet()
             if packet is None:
-                continue
-            if getattr(self.model_runner, "model", None) is None:
-                with self._lock:
-                    self._busy = False
-                    self._busy_start_t = 0.0
-                    self._current_seq = 0
-                time.sleep(0.01)
+                # No new frame to process (idle, paused, no model, or a frame we
+                # already inferred). Wake immediately on enable/source/stop
+                # changes; otherwise poll at a short interval so a fresh camera
+                # frame starts inference with minimal latency instead of waiting
+                # for a UI timer tick.
+                self._event.wait(0.005)
+                self._event.clear()
                 continue
             with self._lock:
                 conf = self._conf
@@ -2305,8 +2365,9 @@ class InferenceWorker:
                 self._busy = False
                 self._busy_start_t = 0.0
                 self._current_seq = 0
-                if self._pending is not None:
-                    self._event.set()
+            # Loop straight back to pull the newest available frame with no
+            # UI-timer dependency. When inference is GPU-bound a fresh frame is
+            # already waiting, so the next prediction starts immediately.
 
 
 class SaveWorker:
@@ -4111,6 +4172,7 @@ class MainWindow(QMainWindow):
         self.camera_worker.start()
         if hasattr(self, "inference_worker") and self.inference_worker is not None:
             self.inference_worker.clear()
+            self.inference_worker.set_frame_source(self.camera_worker.get_latest)
             self.inference_worker.start()
         self.camera_pill.setText("BASLER ON" if backend == "basler" else "CAMERA ON")
         self.camera_pill.set_tone("pass")
@@ -4327,10 +4389,11 @@ class MainWindow(QMainWindow):
             try:
                 # Do not join the inference thread on an operator Stop. If TensorRT is
                 # mid-call, waiting here is exactly what makes the Stop button feel
-                # frozen. self.running is already False, so no new frames will be
-                # submitted. Clear only not-yet-running pending work; the worker stays
-                # alive for the next Run and the current call will finish naturally.
-                self.inference_worker.clear_pending_if_stale(0.0)
+                # frozen. Disable autonomous pulling and detach the frame source so
+                # the worker stops fetching from the stopped camera; it stays alive
+                # for the next Run and any in-flight call finishes naturally.
+                self.inference_worker.set_enabled(False)
+                self.inference_worker.set_frame_source(None)
             except Exception:
                 pass
         if self.cap is not None:
@@ -5319,6 +5382,10 @@ class MainWindow(QMainWindow):
         display_seq = 0
 
         if self.demo_mode:
+            # Demo synthesizes its own detections; halt the autonomous inference
+            # worker so it does not keep pulling/predicting real camera frames.
+            if getattr(self, "inference_worker", None) is not None:
+                self.inference_worker.set_enabled(False)
             frame = self.demo_frame()
             detections = self.demo_detections(frame)
             self._last_frame_ok_t = time.perf_counter()
@@ -5388,17 +5455,12 @@ class MainWindow(QMainWindow):
                 preview_w=preview_w,
                 preview_h=preview_h,
             )
-            if latest_cam is not None and self.running and model_loaded:
-                # v0.9.77: uncapped inference submission. Submit the newest frame whenever
-                # the inference worker is available; latest-frame behavior still
-                # skips stale frames instead of queueing a backlog.
-                if latest_cam.seq != self._last_submitted_inference_seq and self.inference_worker.can_accept():
-                    prev_submit = int(getattr(self, "_last_submitted_inference_seq", 0) or 0)
-                    if self.inference_worker.submit_frame(latest_cam):
-                        if prev_submit > 0 and latest_cam.seq > prev_submit + 1:
-                            self.inference_skipped_frames = int(getattr(self, "inference_skipped_frames", 0) or 0) + (latest_cam.seq - prev_submit - 1)
-                        self._last_submitted_inference_seq = latest_cam.seq
-                        self._last_inference_submit_t = now_loop
+            # Pull-based inference (v0.9.86): the worker fetches the newest
+            # camera frame on its own thread as soon as it is free, so it no
+            # longer waits for this UI timer to push a frame (which inserted up
+            # to one UI-tick of idle between predictions). The UI thread only
+            # enables/disables the worker and reads the latest result below.
+            self.inference_worker.set_enabled(bool(self.running and model_loaded))
 
             inf_fps, dropped, inf_err = self.inference_worker.status()
             self.inference_fps = inf_fps
@@ -5437,8 +5499,9 @@ class MainWindow(QMainWindow):
                     pass
             except Exception:
                 pass
-            # Include worker busy rejects plus frames intentionally skipped between accepted inference frames.
-            self.dropped_inference_frames = int(dropped) + int(getattr(self, "inference_skipped_frames", 0) or 0)
+            # status() already sums worker-side dropped + skipped (never-inferred)
+            # camera frames, so this is the total frames not inspected.
+            self.dropped_inference_frames = int(dropped)
             if inf_err:
                 self._last_prediction_error = inf_err
             latest_inf = self.inference_worker.get_latest()
