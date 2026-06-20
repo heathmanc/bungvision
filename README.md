@@ -1,6 +1,13 @@
-# BungVision Python HMI v0.9.86 - Pull-Based Inference Loop
+# BungVision Python HMI v0.9.87 - Overlay Pixmap Cache
 
-Baseline: v0.9.85 Off-Thread Preview Scaling, based on the v0.9.74 out-of-band stop watchdog production foundation.
+Baseline: v0.9.86 Pull-Based Inference Loop, based on the v0.9.74 out-of-band stop watchdog production foundation.
+
+## Changes in v0.9.87
+
+- Cached the detection/badge overlay as a transparent `QPixmap` inside `CameraWidget`. Qt fires `paintEvent` on every window expose, resize, and focus event — not just the 30 Hz inference timer — and the prior code re-ran all Python coordinate loops (OBB vertex scaling, font metric queries, badge placement math) on every repaint even when the `InspectionResult` had not changed. The overlay pixmap is now rebuilt only when a new result arrives or the display area changes; every other `paintEvent` is two `drawPixmap` calls with no Python iteration.
+- Added `_build_overlay_pixmap(target)` to `CameraWidget`: renders detection boxes, OBB polygons, detection labels, PASS/FAIL/WAIT grade badges, and the FAIL banner into a target-sized transparent pixmap with target-relative coordinates.
+- Cache keyed on `(id(result), target_width, target_height)`. Invalidated on overlay option changes (`set_overlay_options`) so toggling boxes/labels/grades takes effect immediately.
+- Painting change only; no inference, grading, tracking, PLC, camera, TensorRT, model, or image-size behavior changed.
 
 ## Changes in v0.9.86
 
