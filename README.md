@@ -1,6 +1,13 @@
-# BungVision Python HMI v0.9.84 - Inference Parse & PLC Throttle
+# BungVision Python HMI v0.9.85 - Off-Thread Preview Scaling
 
-Baseline: v0.9.83 Inference Warmup & Preview Cache, based on the v0.9.74 out-of-band stop watchdog production foundation.
+Baseline: v0.9.84 Inference Parse & PLC Throttle, based on the v0.9.74 out-of-band stop watchdog production foundation.
+
+## Changes in v0.9.85
+
+- Moved the operator preview downscale (full-resolution cv2.resize + BGR->RGB convert) off the Qt UI thread and into the inference worker for the production overlay-synced display path. The UI thread now only wraps the pre-scaled buffer in a QImage/QPixmap, which keeps the operator screen responsive while inference runs.
+- The UI publishes its current preview content size to the inference worker each tick, so the pre-scaled buffer matches the display area; window resizes self-correct within a frame via a UI-thread fallback rescale.
+- The direct-camera display path (before the first inference result, or when overlays are off) still scales on the UI thread as a fallback.
+- Display-only optimization; the full-resolution frame is unchanged and still used for YOLO, tracking, PASS/FAIL, saves, and PLC logic. No grading, tracking, PLC, camera, TensorRT, model, or image-size behavior changed.
 
 ## Changes in v0.9.84
 

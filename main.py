@@ -45,7 +45,7 @@ from PySide6.QtWidgets import (
 
 from camera_backend import BaslerPylonCamera, create_camera_backend, list_basler_cameras
 
-APP_TITLE = "BungVision Python Line-Side HMI v0.9.84 Inference Parse & PLC Throttle"
+APP_TITLE = "BungVision Python Line-Side HMI v0.9.85 Off-Thread Preview Scaling"
 ROOT = Path(__file__).resolve().parent
 LOG_DIR = ROOT / "logs"
 FAIL_DIR = ROOT / "fail_snapshots"
@@ -1187,6 +1187,35 @@ def bung_matches_battery(bung_label: str, battery_label: str) -> bool:
     return bung_suffix == battery_suffix
 
 
+def build_preview_rgb(frame_bgr: np.ndarray, max_w: int, max_h: int) -> Optional[np.ndarray]:
+    """Aspect-fit downscale + BGR->RGB for the operator preview.
+
+    This is the expensive part of preparing a preview frame (full-resolution
+    cv2.resize + color convert). Running it off the Qt UI thread (in the
+    inference worker) keeps the operator screen responsive. The returned array
+    is contiguous so it can back a QImage directly. The full-resolution frame
+    is untouched and still used for YOLO, tracking, saves, and PASS/FAIL logic.
+    """
+    try:
+        src_h, src_w = frame_bgr.shape[:2]
+    except Exception:
+        return None
+    if src_w <= 0 or src_h <= 0 or max_w <= 0 or max_h <= 0:
+        return None
+    scale = min(max_w / float(src_w), max_h / float(src_h))
+    dst_w = max(1, int(round(src_w * scale)))
+    dst_h = max(1, int(round(src_h * scale)))
+    try:
+        if dst_w != src_w or dst_h != src_h:
+            resized = cv2.resize(frame_bgr, (dst_w, dst_h), interpolation=cv2.INTER_LINEAR)
+        else:
+            resized = frame_bgr
+        rgb = cv2.cvtColor(resized, cv2.COLOR_BGR2RGB)
+        return np.ascontiguousarray(rgb)
+    except Exception:
+        return None
+
+
 class CameraWidget(QWidget):
     def __init__(self):
         super().__init__()
@@ -1242,7 +1271,7 @@ class CameraWidget(QWidget):
         self.show_fail_banner = bool(fail_banner)
         self.update()
 
-    def set_frame(self, frame_bgr: Optional[np.ndarray], result: Optional[InspectionResult], seq: Optional[int] = None) -> None:
+    def set_frame(self, frame_bgr: Optional[np.ndarray], result: Optional[InspectionResult], seq: Optional[int] = None, preview_rgb: Optional[np.ndarray] = None) -> None:
         self.frame_bgr = frame_bgr
         self.result = result
         # Rebuild the display pixmap only when the underlying frame actually
@@ -1252,6 +1281,10 @@ class CameraWidget(QWidget):
         # Qt UI thread. Overlays/badges are drawn from self.result in
         # paintEvent(), so a stable frame can safely reuse the cached pixmap.
         # A widget resize is still handled lazily in paintEvent().
+        #
+        # preview_rgb, when provided, is the display-sized RGB buffer already
+        # scaled off the UI thread by the inference worker; the UI thread then
+        # only wraps it in a QImage/QPixmap instead of resizing a full frame.
         frame_id = id(frame_bgr) if frame_bgr is not None else 0
         if (
             frame_bgr is None
@@ -1262,8 +1295,13 @@ class CameraWidget(QWidget):
         ):
             self._preview_seq = seq
             self._preview_frame_id = frame_id
-            self._build_preview_pixmap()
+            self._build_preview_pixmap(preview_rgb)
         self.update()
+
+    def preview_target_size_hint(self) -> Tuple[int, int]:
+        """Current preview content area (max width/height) for off-thread scaling."""
+        content = self.rect().adjusted(8, 8, -8, -8)
+        return max(1, int(content.width())), max(1, int(content.height()))
 
     def _preview_target_size(self, frame_bgr: np.ndarray) -> Tuple[int, int, int, int]:
         """Return source and preview-render sizes preserving aspect ratio.
@@ -1287,14 +1325,18 @@ class CameraWidget(QWidget):
         dst_h = max(1, int(round(src_h * scale)))
         return int(src_w), int(src_h), int(dst_w), int(dst_h)
 
-    def _build_preview_pixmap(self) -> None:
+    def _build_preview_pixmap(self, preview_rgb: Optional[np.ndarray] = None) -> None:
         """Build/cache a display-sized QPixmap for paintEvent().
 
         This is display-only optimization. It does not alter the full-resolution
         frame used by YOLO, tracking, PASS/FAIL, image saves, or PLC logic.
+
+        When preview_rgb is supplied (already scaled off the UI thread by the
+        inference worker), the costly cv2.resize + cvtColor is skipped and the
+        UI thread only wraps the buffer in a QImage/QPixmap.
         """
         frame = self.frame_bgr
-        if frame is None:
+        if frame is None and preview_rgb is None:
             self._preview_pixmap = None
             self._preview_content_size = (0, 0)
             self._preview_source_shape = (0, 0)
@@ -1302,6 +1344,33 @@ class CameraWidget(QWidget):
             self._qimage_ms = 0.0
             self._scale_ms = 0.0
             return
+        if preview_rgb is not None:
+            try:
+                ph, pw = preview_rgb.shape[:2]
+            except Exception:
+                ph, pw = 0, 0
+            if pw > 0 and ph > 0:
+                content = self.rect().adjusted(8, 8, -8, -8)
+                self._preview_content_size = (int(content.width()), int(content.height()))
+                if frame is not None:
+                    try:
+                        fh, fw = frame.shape[:2]
+                        self._preview_source_shape = (int(fw), int(fh))
+                    except Exception:
+                        pass
+                self._preview_render_size = (int(pw), int(ph))
+                try:
+                    qimg = QImage(preview_rgb.data, pw, ph, preview_rgb.strides[0], QImage.Format_RGB888)
+                    self._preview_pixmap = QPixmap.fromImage(qimg)
+                    self._scale_ms = 0.0
+                    self._qimage_ms = 0.0
+                    return
+                except Exception:
+                    pass
+            # Fall back to UI-thread scaling if the supplied buffer was unusable.
+            if frame is None:
+                self._preview_pixmap = None
+                return
         src_w, src_h, dst_w, dst_h = self._preview_target_size(frame)
         if dst_w <= 0 or dst_h <= 0:
             self._preview_pixmap = None
@@ -1887,6 +1956,7 @@ class InferencePacket:
     parse_ms: float = 0.0
     cycle_ms: float = 0.0
     idle_ms: float = 0.0
+    preview_rgb: Optional[np.ndarray] = None
 
 
 class CameraCaptureWorker:
@@ -2015,6 +2085,10 @@ class InferenceWorker:
         self._iou = 0.45
         self._imgsz = 736
         self._device = ""
+        # Operator preview target size, published by the UI thread. When set,
+        # the worker pre-scales the displayed frame off the UI thread.
+        self._preview_w = 0
+        self._preview_h = 0
         self._fps = 0.0
         self._last_done_t = 0.0
         self._dropped = 0
@@ -2065,12 +2139,14 @@ class InferenceWorker:
             self._current_seq = 0
         self._event.clear()
 
-    def update_config(self, conf: float, iou: float, imgsz: int, device: str = "") -> None:
+    def update_config(self, conf: float, iou: float, imgsz: int, device: str = "", preview_w: int = 0, preview_h: int = 0) -> None:
         with self._lock:
             self._conf = float(conf)
             self._iou = float(iou)
             self._imgsz = int(imgsz)
             self._device = str(device or "").strip()
+            self._preview_w = max(0, int(preview_w))
+            self._preview_h = max(0, int(preview_h))
 
     def can_accept(self) -> bool:
         """True when no frame is queued and YOLO is not currently predicting.
@@ -2177,6 +2253,8 @@ class InferenceWorker:
                 iou = self._iou
                 imgsz = self._imgsz
                 device = self._device
+                preview_w = self._preview_w
+                preview_h = self._preview_h
             t0 = time.perf_counter()
             idle_ms = ((t0 - self._last_done_t) * 1000.0) if self._last_done_t > 0 else 0.0
             detections: List[Detection] = []
@@ -2196,6 +2274,12 @@ class InferenceWorker:
                 inst = 1.0 / max(1e-6, done - self._last_done_t)
                 self._fps = inst if self._fps <= 0 else (self._fps * 0.85 + inst * 0.15)
             self._last_done_t = done
+            # Pre-scale the displayed frame here, off the Qt UI thread. This is
+            # the costly cv2.resize + BGR->RGB conversion that previously ran in
+            # CameraWidget.set_frame() on every displayed frame.
+            preview_rgb = None
+            if preview_w > 0 and preview_h > 0:
+                preview_rgb = build_preview_rgb(packet.frame, preview_w, preview_h)
             result = InferencePacket(
                 seq=packet.seq,
                 frame=packet.frame,
@@ -2208,6 +2292,7 @@ class InferenceWorker:
                 parse_ms=parse_ms,
                 cycle_ms=cycle_ms,
                 idle_ms=idle_ms,
+                preview_rgb=preview_rgb,
             )
             with self._lock:
                 self._latest = result
@@ -2875,6 +2960,7 @@ class MainWindow(QMainWindow):
         self.demo_mode = False
         self.running = False
         self.last_frame: Optional[np.ndarray] = None
+        self.last_preview_rgb: Optional[np.ndarray] = None
         self.last_result: Optional[InspectionResult] = None
         self.frame_timer = QTimer(self)
         self.frame_timer.timeout.connect(self.on_timer)
@@ -3883,6 +3969,7 @@ class MainWindow(QMainWindow):
             self._next_inspection_id = 1
         self.last_logged_status = None
         self.last_frame = None
+        self.last_preview_rgb = None
         self.last_result = None
         self._last_camera_seq_seen = 0
         self._last_submitted_inference_seq = 0
@@ -5228,6 +5315,7 @@ class MainWindow(QMainWindow):
         latest_cam_seq = 0
         frame_for_display = None
         overlay_result = None
+        preview_for_display = None
         display_seq = 0
 
         if self.demo_mode:
@@ -5291,11 +5379,14 @@ class MainWindow(QMainWindow):
 
         # Keep the inference worker pointed at the current operator settings.
         if getattr(self, "inference_worker", None) is not None:
+            preview_w, preview_h = self.camera_widget.preview_target_size_hint()
             self.inference_worker.update_config(
                 self.conf_spin.value() / 100.0,
                 float(getattr(self, "yolo_iou", 0.45)),
                 int(self.imgsz_spin.value()),
                 self.device_edit.text().strip(),
+                preview_w=preview_w,
+                preview_h=preview_h,
             )
             if latest_cam is not None and self.running and model_loaded:
                 # v0.9.77: uncapped inference submission. Submit the newest frame whenever
@@ -5387,6 +5478,7 @@ class MainWindow(QMainWindow):
                 result.fps = self.fps
                 self.update_tracker(result, latest_inf.frame)
                 self.last_frame = latest_inf.frame
+                self.last_preview_rgb = getattr(latest_inf, "preview_rgb", None)
                 self.last_result = result
                 self.update_decision(result)
 
@@ -5401,14 +5493,19 @@ class MainWindow(QMainWindow):
         if self.running and model_loaded and overlay_enabled and has_synced_result and result_age <= 0.75:
             frame_for_display = self.last_frame
             overlay_result = self.last_result
+            preview_for_display = getattr(self, "last_preview_rgb", None)
             display_seq = int(getattr(self, "_last_result_seq", 0) or 0)
         elif latest_cam is not None:
+            # Direct-camera path (no synced result yet): the worker did not
+            # pre-scale this frame, so the UI thread scales it as a fallback.
             frame_for_display = latest_cam.frame
             overlay_result = None
+            preview_for_display = None
             display_seq = int(latest_cam.seq)
         elif self.last_frame is not None:
             frame_for_display = self.last_frame
             overlay_result = self.last_result if overlay_enabled else None
+            preview_for_display = getattr(self, "last_preview_rgb", None)
             display_seq = int(getattr(self, "_last_result_seq", 0) or 0)
 
         if frame_for_display is None:
@@ -5421,7 +5518,7 @@ class MainWindow(QMainWindow):
 
         # v0.9.77: uncapped preview refresh. Update the camera widget on every UI
         # timer tick that has a frame available.
-        self.camera_widget.set_frame(frame_for_display, overlay_result, seq=display_seq)
+        self.camera_widget.set_frame(frame_for_display, overlay_result, seq=display_seq, preview_rgb=preview_for_display)
         self._record_preview_submit(display_seq)
         self._last_preview_update_t = now_loop
         # PLC state submission and the expensive QLabel/card refreshes do not
