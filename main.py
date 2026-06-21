@@ -45,7 +45,7 @@ from PySide6.QtWidgets import (
 
 from camera_backend import BaslerPylonCamera, create_camera_backend, list_basler_cameras
 
-APP_TITLE = "BungVision Python Line-Side HMI v0.9.91 Resizable Preview"
+APP_TITLE = "BungVision Python Line-Side HMI v0.9.92 Inference FPS Optimizations"
 ROOT = Path(__file__).resolve().parent
 LOG_DIR = ROOT / "logs"
 FAIL_DIR = ROOT / "fail_snapshots"
@@ -1991,13 +1991,24 @@ class ModelRunner:
         try:
             dummy = np.zeros((warm_imgsz, warm_imgsz, 3), dtype=np.uint8)
             t_warm0 = time.perf_counter()
-            self.predict(dummy, conf=0.25, iou=0.45, imgsz=warm_imgsz, device=device)
+            # The warmup is the first predict and triggers lazy TensorRT/Ultralytics
+            # backend init that evaluates argv-sensitive properties. Keep it under
+            # the argv guard since predict() itself no longer wraps each call.
+            with _clean_sys_argv_for_ultralytics():
+                self.predict(dummy, conf=0.25, iou=0.45, imgsz=warm_imgsz, device=device)
             self.last_warmup_ms = (time.perf_counter() - t_warm0) * 1000.0
             _write_debug_log(
                 f"MODEL_WARMUP ok device={device!r} imgsz={warm_imgsz} ms={self.last_warmup_ms:.1f}"
             )
         except Exception:
             _write_debug_log("MODEL_WARMUP failed:\n" + traceback.format_exc())
+
+        # v0.9.92 (Fix 4): re-apply CPU thread limits after Ultralytics import,
+        # model construction, and the warmup predict. Torch/Ultralytics can reset
+        # the intra-op thread count during these steps, which would otherwise let
+        # CPU helper threads compete with the GPU inference stream and the camera
+        # worker, causing the FPS fluctuation seen on Jetson.
+        _configure_torch_threading()
 
         warm_note = f"\nWarmup: {self.last_warmup_ms:.0f} ms (device={device or 'auto'})" if self.last_warmup_ms > 0 else ""
         return f"Loaded model: {model_path}\nRequested Task: {self.requested_task}\nRuntime Task: {self.task}\nClasses: {self.names}{warm_note}"
@@ -2050,9 +2061,13 @@ class ModelRunner:
         if device:
             kwargs["device"] = device
         t_backend0 = time.perf_counter()
-        with _clean_sys_argv_for_ultralytics():
-            _force_matplotlib_agg_backend("before predict")
-            results = self.model.predict(frame_bgr, **kwargs)
+        # v0.9.92: the per-predict sys.argv sanitize and matplotlib-Agg force were
+        # removed from this hot path. argv is kept string-only from startup onward
+        # (and by _clean_sys_argv_for_ultralytics on exit), and the Agg backend is
+        # forced at startup and model load, so repeating either work on every frame
+        # was pure overhead at 11-30 Hz. The first predict (warmup) still runs under
+        # the argv guard in load(), which is where lazy TensorRT init happens.
+        results = self.model.predict(frame_bgr, **kwargs)
         t_backend1 = time.perf_counter()
         self.last_backend_ms = (t_backend1 - t_backend0) * 1000.0
         if not results:
@@ -2457,8 +2472,6 @@ class InferenceWorker:
                 iou = self._iou
                 imgsz = self._imgsz
                 device = self._device
-                preview_w = self._preview_w
-                preview_h = self._preview_h
             t0 = time.perf_counter()
             idle_ms = ((t0 - self._last_done_t) * 1000.0) if self._last_done_t > 0 else 0.0
             detections: List[Detection] = []
@@ -2478,12 +2491,12 @@ class InferenceWorker:
                 inst = 1.0 / max(1e-6, done - self._last_done_t)
                 self._fps = inst if self._fps <= 0 else (self._fps * 0.85 + inst * 0.15)
             self._last_done_t = done
-            # Pre-scale the displayed frame here, off the Qt UI thread. This is
-            # the costly cv2.resize + BGR->RGB conversion that previously ran in
-            # CameraWidget.set_frame() on every displayed frame.
-            preview_rgb = None
-            if preview_w > 0 and preview_h > 0:
-                preview_rgb = build_preview_rgb(packet.frame, preview_w, preview_h)
+            # v0.9.92 (Fix 1): preview downscale (cv2.resize + BGR->RGB) is no
+            # longer done here. Running it inside the inference loop inserted
+            # ~8-15 ms of CPU work between GPU dispatches on full-resolution
+            # frames, extending cycle time and causing FPS fluctuation. The
+            # PreviewScaleWorker now scales the latest result frame on its own
+            # thread, so this loop returns to the next prediction immediately.
             result = InferencePacket(
                 seq=packet.seq,
                 frame=packet.frame,
@@ -2496,7 +2509,7 @@ class InferenceWorker:
                 parse_ms=parse_ms,
                 cycle_ms=cycle_ms,
                 idle_ms=idle_ms,
-                preview_rgb=preview_rgb,
+                preview_rgb=None,
             )
             with self._lock:
                 self._latest = result
@@ -2512,6 +2525,98 @@ class InferenceWorker:
             # Loop straight back to pull the newest available frame with no
             # UI-timer dependency. When inference is GPU-bound a fresh frame is
             # already waiting, so the next prediction starts immediately.
+
+
+class PreviewScaleWorker:
+    """Downscale the latest inference result frame for the operator preview.
+
+    v0.9.92 (Fix 1): the full-resolution cv2.resize + BGR->RGB conversion used
+    to run inside the inference worker loop, inserting CPU work between GPU
+    dispatches and slowing inference FPS. This worker does that scaling on its
+    own thread instead, so the inference loop returns to the next prediction
+    immediately. The scaled preview is tagged with the source frame sequence so
+    the UI only uses it when it matches the frame currently being displayed;
+    otherwise the UI falls back to scaling that one frame itself.
+    """
+
+    def __init__(self, source=None, log_cb=None):
+        self.log_cb = log_cb
+        self._lock = threading.RLock()
+        self._stop = threading.Event()
+        self._thread: Optional[threading.Thread] = None
+        self._source = source
+        self._enabled = False
+        self._preview_w = 0
+        self._preview_h = 0
+        self._last_src_seq = -1
+        self._preview_seq = -1
+        self._preview_rgb: Optional[np.ndarray] = None
+
+    def start(self) -> None:
+        if self._thread is not None and self._thread.is_alive():
+            return
+        self._stop.clear()
+        self._thread = threading.Thread(target=self._run, name="BungVisionPreviewWorker", daemon=True)
+        self._thread.start()
+
+    def stop(self, timeout: float = 1.5) -> None:
+        self._stop.set()
+        thread = self._thread
+        if thread is not None and thread.is_alive():
+            thread.join(timeout=timeout)
+        self._thread = None
+
+    def set_source(self, source) -> None:
+        with self._lock:
+            self._source = source
+
+    def set_enabled(self, enabled: bool) -> None:
+        with self._lock:
+            self._enabled = bool(enabled)
+
+    def update_size(self, preview_w: int, preview_h: int) -> None:
+        with self._lock:
+            self._preview_w = int(preview_w)
+            self._preview_h = int(preview_h)
+
+    def clear(self) -> None:
+        with self._lock:
+            self._last_src_seq = -1
+            self._preview_seq = -1
+            self._preview_rgb = None
+
+    def get_preview(self) -> Tuple[int, Optional[np.ndarray]]:
+        """Return (seq, preview_rgb) for the most recently scaled frame."""
+        with self._lock:
+            return int(self._preview_seq), self._preview_rgb
+
+    def _run(self) -> None:
+        while not self._stop.is_set():
+            with self._lock:
+                enabled = self._enabled
+                source = self._source
+                preview_w = self._preview_w
+                preview_h = self._preview_h
+                last_seq = self._last_src_seq
+            if not enabled or source is None or preview_w <= 0 or preview_h <= 0:
+                self._stop.wait(0.01)
+                continue
+            try:
+                packet = source()
+            except Exception:
+                packet = None
+            frame = getattr(packet, "frame", None) if packet is not None else None
+            seq = int(getattr(packet, "seq", 0) or 0) if packet is not None else 0
+            if frame is None or seq == last_seq:
+                # Nothing new to scale; poll at a short interval so a fresh
+                # result is picked up with minimal latency without busy-spinning.
+                self._stop.wait(0.003)
+                continue
+            preview_rgb = build_preview_rgb(frame, preview_w, preview_h)
+            with self._lock:
+                self._last_src_seq = seq
+                self._preview_seq = seq
+                self._preview_rgb = preview_rgb
 
 
 class SaveWorker:
@@ -3652,6 +3757,11 @@ class MainWindow(QMainWindow):
         self.camera_worker: Optional[CameraCaptureWorker] = None
         self.inference_worker = InferenceWorker(self.model_runner, log_cb=self.log_from_worker)
         self.inference_worker.start()
+        # Off-thread operator preview scaler (v0.9.92). Pulls the latest inference
+        # result frame and downscales it for display so the inference loop never
+        # spends time on cv2.resize between GPU dispatches.
+        self.preview_worker = PreviewScaleWorker(source=self.inference_worker.get_latest, log_cb=self.log_from_worker)
+        self.preview_worker.start()
         self.save_worker = SaveWorker(log_cb=self.log_from_worker)
         self.save_worker.start()
         self._loading_settings = False
@@ -4228,6 +4338,26 @@ class MainWindow(QMainWindow):
         side_w = max(0, total - cam_w)
         self.preview_splitter.setSizes([cam_w, side_w])
 
+    def _matched_preview_rgb(self, display_seq: int) -> Optional[np.ndarray]:
+        """Return the off-thread-scaled preview only if it matches the display frame.
+
+        The PreviewScaleWorker tags each scaled frame with its source sequence.
+        When the scaled preview matches the frame currently being displayed, use
+        it (no UI-thread resize). Otherwise return None so CameraWidget scales
+        that single frame itself, keeping the preview correct during the brief
+        window before the worker catches up.
+        """
+        pw = getattr(self, "preview_worker", None)
+        if pw is None:
+            return None
+        try:
+            pseq, prgb = pw.get_preview()
+        except Exception:
+            return None
+        if prgb is not None and int(pseq) == int(display_seq):
+            return prgb
+        return None
+
     def on_overlay_control_changed(self):
         if hasattr(self, "camera_widget"):
             self.camera_widget.set_overlay_options(
@@ -4571,6 +4701,8 @@ class MainWindow(QMainWindow):
                 if hasattr(self, "inference_worker") and self.inference_worker is not None:
                     self.inference_worker.clear()
                     self.inference_worker.start()
+                if getattr(self, "preview_worker", None) is not None:
+                    self.preview_worker.clear()
             except Exception:
                 pass
             self.demo_check.setChecked(False)
@@ -4644,6 +4776,8 @@ class MainWindow(QMainWindow):
         self._last_inference_result_t = 0.0
         if hasattr(self, "inference_worker") and self.inference_worker is not None:
             self.inference_worker.clear()
+        if getattr(self, "preview_worker", None) is not None:
+            self.preview_worker.clear()
 
         if reset_counts:
             self.total_count = 0
@@ -4755,6 +4889,9 @@ class MainWindow(QMainWindow):
             self.inference_worker.clear()
             self.inference_worker.set_frame_source(self.camera_worker.get_latest)
             self.inference_worker.start()
+        if getattr(self, "preview_worker", None) is not None:
+            self.preview_worker.clear()
+            self.preview_worker.start()
         self.camera_pill.setText("BASLER ON" if backend == "basler" else "CAMERA ON")
         self.camera_pill.set_tone("pass")
         try:
@@ -6099,12 +6236,17 @@ class MainWindow(QMainWindow):
                 preview_w=preview_w,
                 preview_h=preview_h,
             )
+            # Keep the off-thread preview scaler sized and gated to match.
+            if getattr(self, "preview_worker", None) is not None:
+                self.preview_worker.update_size(preview_w, preview_h)
             # Pull-based inference (v0.9.86): the worker fetches the newest
             # camera frame on its own thread as soon as it is free, so it no
             # longer waits for this UI timer to push a frame (which inserted up
             # to one UI-tick of idle between predictions). The UI thread only
             # enables/disables the worker and reads the latest result below.
             self.inference_worker.set_enabled(bool(self.running and model_loaded))
+            if getattr(self, "preview_worker", None) is not None:
+                self.preview_worker.set_enabled(bool(self.running and model_loaded))
 
             inf_fps, dropped, inf_err = self.inference_worker.status()
             self.inference_fps = inf_fps
@@ -6178,7 +6320,8 @@ class MainWindow(QMainWindow):
                 result.fps = self.fps
                 self.update_tracker(result, latest_inf.frame)
                 self.last_frame = latest_inf.frame
-                self.last_preview_rgb = getattr(latest_inf, "preview_rgb", None)
+                # preview_rgb is produced asynchronously by preview_worker now;
+                # it is matched to the display frame by sequence below.
                 self.last_result = result
                 self.update_decision(result)
 
@@ -6193,11 +6336,11 @@ class MainWindow(QMainWindow):
         if self.running and model_loaded and overlay_enabled and has_synced_result and result_age <= 0.75:
             frame_for_display = self.last_frame
             overlay_result = self.last_result
-            preview_for_display = getattr(self, "last_preview_rgb", None)
             display_seq = int(getattr(self, "_last_result_seq", 0) or 0)
+            preview_for_display = self._matched_preview_rgb(display_seq)
         elif latest_cam is not None:
-            # Direct-camera path (no synced result yet): the worker did not
-            # pre-scale this frame, so the UI thread scales it as a fallback.
+            # Direct-camera path (no synced result yet): the preview worker only
+            # scales inference-result frames, so the UI thread scales this one.
             frame_for_display = latest_cam.frame
             overlay_result = None
             preview_for_display = None
@@ -6205,8 +6348,8 @@ class MainWindow(QMainWindow):
         elif self.last_frame is not None:
             frame_for_display = self.last_frame
             overlay_result = self.last_result if overlay_enabled else None
-            preview_for_display = getattr(self, "last_preview_rgb", None)
             display_seq = int(getattr(self, "_last_result_seq", 0) or 0)
+            preview_for_display = self._matched_preview_rgb(display_seq)
 
         if frame_for_display is None:
             self.camera_widget.set_frame(None, None)
@@ -6842,6 +6985,11 @@ class MainWindow(QMainWindow):
         if getattr(self, "inference_worker", None) is not None:
             try:
                 self.inference_worker.stop()
+            except Exception:
+                pass
+        if getattr(self, "preview_worker", None) is not None:
+            try:
+                self.preview_worker.stop()
             except Exception:
                 pass
         if getattr(self, "save_worker", None) is not None:
