@@ -526,21 +526,41 @@ class BaslerPylonCamera(BaseCamera):
             return CameraOpenResult(False, f"Basler/Pylon camera error: {exc}")
 
     def _try_restart_grabbing(self) -> bool:
-        """Attempt to restart the Basler grab loop after a stall or stop event."""
+        """Attempt to recover after a grab stall or USB disconnect.
+
+        A simple StartGrabbing() call is sufficient for soft stalls. For USB
+        removal events ('Device has been removed') the camera object is invalid
+        and a full re-open (release + open) is required instead.
+        """
+        # First try the cheap path: just restart the grab loop.
         try:
-            if self.camera is None or not self.camera.IsOpen():
-                return False
-            if self.camera.IsGrabbing():
-                self.camera.StopGrabbing()
+            if self.camera is not None and self.camera.IsOpen():
+                if self.camera.IsGrabbing():
+                    self.camera.StopGrabbing()
+                self.camera.StartGrabbing(self._pylon.GrabStrategy_LatestImageOnly)
+                self._grab_restart_count += 1
+                self.last_grab_error = f"grab restarted (restart #{self._grab_restart_count})"
+                return True
+        except Exception:
+            pass
+
+        # Cheap path failed — device likely disconnected. Release fully and
+        # re-open (re-enumerates USB/GigE, creates a new InstantCamera).
+        try:
+            self.release()
         except Exception:
             pass
         try:
-            self.camera.StartGrabbing(self._pylon.GrabStrategy_LatestImageOnly)
-            self._grab_restart_count += 1
-            self.last_grab_error = f"grab restarted (restart #{self._grab_restart_count})"
-            return True
+            result = self.open()
+            if result.ok:
+                self._grab_restart_count += 1
+                self.last_grab_error = f"device re-opened after disconnect (restart #{self._grab_restart_count})"
+                return True
+            else:
+                self.last_grab_error = f"device re-open failed: {result.message}"
+                return False
         except Exception as exc:
-            self.last_grab_error = f"grab restart failed: {exc}"
+            self.last_grab_error = f"device re-open exception: {exc}"
             return False
 
     def read(self) -> Tuple[bool, Optional[np.ndarray]]:
