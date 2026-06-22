@@ -45,7 +45,7 @@ from PySide6.QtWidgets import (
 
 from camera_backend import BaslerPylonCamera, create_camera_backend, list_basler_cameras
 
-APP_TITLE = "BungVision Python Line-Side HMI v0.9.92 Inference FPS Optimizations"
+APP_TITLE = "BungVision Python Line-Side HMI v0.9.93 Stop Diagnostics"
 ROOT = Path(__file__).resolve().parent
 LOG_DIR = ROOT / "logs"
 FAIL_DIR = ROOT / "fail_snapshots"
@@ -4065,9 +4065,9 @@ class MainWindow(QMainWindow):
         # Keep emergency keyboard shortcuts, but remove the visible menu actions.
         self.menuBar().setVisible(False)
         self._esc_stop_shortcut = QShortcut(QKeySequence("Esc"), self)
-        self._esc_stop_shortcut.activated.connect(lambda: self.request_operator_stop("esc"))
+        self._esc_stop_shortcut.activated.connect(lambda: self.request_operator_stop("esc") if bool(getattr(self, "running", False)) else None)
         self._f12_stop_shortcut = QShortcut(QKeySequence("F12"), self)
-        self._f12_stop_shortcut.activated.connect(lambda: self.request_operator_stop("f12"))
+        self._f12_stop_shortcut.activated.connect(lambda: self.request_operator_stop("f12") if bool(getattr(self, "running", False)) else None)
 
     def apply_theme(self):
         # App-level rules are needed for QMessageBox/QFileDialog because they are
@@ -4971,6 +4971,17 @@ class MainWindow(QMainWindow):
         self._stop_request_source = str(source or "button")
         try:
             self.log(f"OPERATOR_STOP_REQUEST source={source} count={self._operator_stop_count} {self._operator_stop_snapshot()}")
+        except Exception:
+            pass
+        # Always write the stop source to the debug log so it is never filtered
+        # out by _should_file_log. This is the primary diagnostic for unexpected stops.
+        try:
+            import traceback as _tb
+            _write_debug_log(
+                f"OPERATOR_STOP_REQUEST source={source!r} count={self._operator_stop_count} "
+                f"{self._operator_stop_snapshot()}\n"
+                f"  callstack: {'|'.join(l.strip() for l in _tb.format_stack()[-6:-1])}"
+            )
         except Exception:
             pass
 
