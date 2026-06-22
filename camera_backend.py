@@ -275,6 +275,9 @@ class BaslerPylonCamera(BaseCamera):
         self._actual_pixel_format = ""
         self._resulting_fps = 0.0
         self._throughput_limit = 0.0
+        self._consecutive_grab_failures = 0
+        self._grab_restart_count = 0
+        self.last_grab_error = ""
 
     @staticmethod
     def available() -> Tuple[bool, str]:
@@ -522,10 +525,38 @@ class BaslerPylonCamera(BaseCamera):
             self.release()
             return CameraOpenResult(False, f"Basler/Pylon camera error: {exc}")
 
+    def _try_restart_grabbing(self) -> bool:
+        """Attempt to restart the Basler grab loop after a stall or stop event."""
+        try:
+            if self.camera is None or not self.camera.IsOpen():
+                return False
+            if self.camera.IsGrabbing():
+                self.camera.StopGrabbing()
+        except Exception:
+            pass
+        try:
+            self.camera.StartGrabbing(self._pylon.GrabStrategy_LatestImageOnly)
+            self._grab_restart_count += 1
+            self.last_grab_error = f"grab restarted (restart #{self._grab_restart_count})"
+            return True
+        except Exception as exc:
+            self.last_grab_error = f"grab restart failed: {exc}"
+            return False
+
     def read(self) -> Tuple[bool, Optional[np.ndarray]]:
         if self.camera is None or self.converter is None:
             return False, None
         import time
+        # If the grab loop has stopped (e.g. Basler driver event, GigE timeout),
+        # restart it automatically rather than returning failed frames indefinitely.
+        try:
+            if not self.camera.IsGrabbing():
+                self._consecutive_grab_failures += 1
+                self.last_grab_error = f"IsGrabbing=False (failure #{self._consecutive_grab_failures})"
+                self._try_restart_grabbing()
+                return False, None
+        except Exception:
+            pass
         t0 = time.perf_counter()
         grab = None
         try:
@@ -535,13 +566,23 @@ class BaslerPylonCamera(BaseCamera):
             if grab is None or not grab.GrabSucceeded():
                 try:
                     if grab is not None:
+                        err_code = grab.GetErrorCode() if hasattr(grab, "GetErrorCode") else 0
+                        err_desc = grab.GetErrorDescription() if hasattr(grab, "GetErrorDescription") else ""
+                        self.last_grab_error = f"GrabFailed code={err_code} desc={err_desc!r}"
                         grab.Release()
                 except Exception:
                     pass
+                self._consecutive_grab_failures += 1
                 self.last_convert_ms = 0.0
                 self.last_array_ms = 0.0
                 self.last_read_total_ms = (time.perf_counter() - t0) * 1000.0
+                # After repeated consecutive failures, attempt to restart the grab loop.
+                if self._consecutive_grab_failures >= 5:
+                    self._try_restart_grabbing()
+                    self._consecutive_grab_failures = 0
                 return False, None
+            self._consecutive_grab_failures = 0
+            self.last_grab_error = ""
             t2 = time.perf_counter()
             img = self.converter.Convert(grab)
             t3 = time.perf_counter()
@@ -555,13 +596,18 @@ class BaslerPylonCamera(BaseCamera):
             except Exception:
                 pass
             return True, arr
-        except Exception:
+        except Exception as exc:
             try:
                 if grab is not None:
                     grab.Release()
             except Exception:
                 pass
+            self._consecutive_grab_failures += 1
+            self.last_grab_error = f"read exception: {exc}"
             self.last_read_total_ms = (time.perf_counter() - t0) * 1000.0
+            if self._consecutive_grab_failures >= 5:
+                self._try_restart_grabbing()
+                self._consecutive_grab_failures = 0
             return False, None
 
     def release(self) -> None:

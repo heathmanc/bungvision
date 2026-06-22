@@ -45,7 +45,7 @@ from PySide6.QtWidgets import (
 
 from camera_backend import BaslerPylonCamera, create_camera_backend, list_basler_cameras
 
-APP_TITLE = "BungVision Python Line-Side HMI v0.9.93 Stop Diagnostics"
+APP_TITLE = "BungVision Python Line-Side HMI v0.9.93 Basler Grab Auto-Recovery"
 ROOT = Path(__file__).resolve().parent
 LOG_DIR = ROOT / "logs"
 FAIL_DIR = ROOT / "fail_snapshots"
@@ -2284,8 +2284,18 @@ class CameraCaptureWorker:
                     self._interval_ms = float(interval_ms)
                     self._latest = CameraFramePacket(seq=self._seq, frame=frame, timestamp=now, fps=self._fps, read_ms=float(read_ms), interval_ms=float(interval_ms))
             else:
+                # Surface any Basler grab-level error (stall, IsGrabbing=False,
+                # auto-restart events) so it appears in the UI error pill and
+                # gets written to the log when it first occurs.
+                grab_err = str(getattr(self.cap, "last_grab_error", "") or "")
+                err_msg = grab_err if grab_err else "Camera read failed"
                 with self._lock:
-                    self._last_error = "Camera read failed"
+                    prev_err = self._last_error
+                    self._last_error = err_msg
+                if grab_err and grab_err != getattr(self, "_last_logged_grab_err", ""):
+                    self._last_logged_grab_err = grab_err
+                    if self.log_cb:
+                        self.log_cb(f"BASLER_GRAB_ERROR: {grab_err}")
                 time.sleep(0.01)
 
 
