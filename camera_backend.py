@@ -210,8 +210,60 @@ class OpenCVCamera(BaseCamera):
         except Exception:
             pass
 
+    def _build_gstreamer_pipeline(self) -> str:
+        """Build a Jetson-optimised GStreamer pipeline that uses nvjpegdec for
+        hardware MJPG decode instead of OpenCV's software libjpeg path.
+
+        This is the recommended backend for USB cameras on Jetson when the
+        camera streams MJPG at high resolution (e.g. 2592x1944 @ 30fps),
+        because software MJPG decode on ARM cores limits throughput to ~15fps.
+        nvjpegdec offloads decode to the Jetson media engine and removes the
+        CPU bottleneck entirely.
+
+        Select backend=GStreamer and set the OpenCV source field to "gstreamer"
+        (or leave it empty) to activate this pipeline. The device node is
+        derived from the numeric camera index (default /dev/video0).
+        """
+        dev = f"/dev/video{self.source}" if isinstance(self.source, int) else str(self.source or "/dev/video0")
+        w = int(self.width or 2592)
+        h = int(self.height or 1944)
+        fps = int(self.fps or 30)
+        return (
+            f"v4l2src device={dev} ! "
+            f"image/jpeg,width={w},height={h},framerate={fps}/1 ! "
+            f"nvjpegdec ! "
+            f"video/x-raw ! "
+            f"videoconvert ! "
+            f"video/x-raw,format=BGR ! "
+            f"appsink max-buffers=1 drop=true sync=false"
+        )
+
     def open(self) -> CameraOpenResult:
         try:
+            # GStreamer backend: build a hardware-decode pipeline for Jetson.
+            # When the api is 'gstreamer', ignore _auto_opencv_candidates and
+            # use nvjpegdec to offload MJPG decode from the ARM cores.
+            if self.api == "gstreamer":
+                pipeline = self._build_gstreamer_pipeline()
+                cap = cv2.VideoCapture(pipeline, cv2.CAP_GSTREAMER)
+                if cap is not None and cap.isOpened():
+                    self.cap = cap
+                    self.actual_api = "gstreamer"
+                    try:
+                        self.actual_width = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH) or self.width)
+                        self.actual_height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT) or self.height)
+                        self.actual_fps = float(cap.get(cv2.CAP_PROP_FPS) or self.fps)
+                        self.actual_fourcc = "MJPG→BGR"
+                    except Exception:
+                        pass
+                    return CameraOpenResult(True, f"GStreamer (nvjpegdec) pipeline opened {self.actual_width}x{self.actual_height}@{self.actual_fps:.0f}fps")
+                try:
+                    if cap is not None:
+                        cap.release()
+                except Exception:
+                    pass
+                return CameraOpenResult(False, f"GStreamer pipeline failed to open. Ensure JetPack GStreamer and nvjpegdec are installed.\nPipeline: {pipeline}")
+
             if self.api == "auto":
                 candidates = _auto_opencv_candidates(self.source)
             else:
