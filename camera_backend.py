@@ -210,59 +210,111 @@ class OpenCVCamera(BaseCamera):
         except Exception:
             pass
 
-    def _build_gstreamer_pipeline(self) -> str:
-        """Build a Jetson-optimised GStreamer pipeline that uses nvjpegdec for
-        hardware MJPG decode instead of OpenCV's software libjpeg path.
+    def _gstreamer_pipeline_candidates(self) -> list[tuple[str, str]]:
+        """Return (label, pipeline) candidates for hardware MJPG decode on Jetson.
 
-        This is the recommended backend for USB cameras on Jetson when the
-        camera streams MJPG at high resolution (e.g. 2592x1944 @ 30fps),
-        because software MJPG decode on ARM cores limits throughput to ~15fps.
-        nvjpegdec offloads decode to the Jetson media engine and removes the
-        CPU bottleneck entirely.
+        The exact element chain that works depends on the JetPack version and
+        which GStreamer plugins are installed, so we try several known-good
+        pipelines in order and use the first that opens:
 
-        Select backend=GStreamer and set the OpenCV source field to "gstreamer"
-        (or leave it empty) to activate this pipeline. The device node is
-        derived from the numeric camera index (default /dev/video0).
+        1. nvv4l2decoder (JetPack 5/6 standard hardware MJPG decoder) + nvvidconv
+        2. nvjpegdec + nvvidconv (NVMM-aware conversion)
+        3. nvjpegdec + videoconvert (CPU conversion of decoded raw)
+        4. jpegdec (CPU decode, but pipelined off the OpenCV read thread)
+
+        Software MJPG decode via OpenCV/libjpeg on ARM caps a 5MP stream at
+        ~15fps; the hardware paths (1-3) remove that bottleneck.
         """
         dev = f"/dev/video{self.source}" if isinstance(self.source, int) else str(self.source or "/dev/video0")
         w = int(self.width or 2592)
         h = int(self.height or 1944)
         fps = int(self.fps or 30)
-        return (
-            f"v4l2src device={dev} ! "
-            f"image/jpeg,width={w},height={h},framerate={fps}/1 ! "
-            f"nvjpegdec ! "
-            f"video/x-raw ! "
-            f"videoconvert ! "
-            f"video/x-raw,format=BGR ! "
-            f"appsink max-buffers=1 drop=true sync=false"
-        )
+        caps = f"image/jpeg,width={w},height={h},framerate={fps}/1"
+        sink = "appsink max-buffers=1 drop=true sync=false"
+        return [
+            (
+                "nvv4l2decoder",
+                f"v4l2src device={dev} io-mode=2 ! {caps} ! jpegparse ! "
+                f"nvv4l2decoder mjpeg=1 ! nvvidconv ! video/x-raw,format=BGRx ! "
+                f"videoconvert ! video/x-raw,format=BGR ! {sink}",
+            ),
+            (
+                "nvjpegdec+nvvidconv",
+                f"v4l2src device={dev} ! {caps} ! nvjpegdec ! "
+                f"nvvidconv ! video/x-raw,format=BGRx ! "
+                f"videoconvert ! video/x-raw,format=BGR ! {sink}",
+            ),
+            (
+                "nvjpegdec+videoconvert",
+                f"v4l2src device={dev} ! {caps} ! nvjpegdec ! "
+                f"video/x-raw ! videoconvert ! video/x-raw,format=BGR ! {sink}",
+            ),
+            (
+                "jpegdec (CPU)",
+                f"v4l2src device={dev} ! {caps} ! jpegdec ! "
+                f"videoconvert ! video/x-raw,format=BGR ! {sink}",
+            ),
+        ]
 
     def open(self) -> CameraOpenResult:
         try:
-            # GStreamer backend: build a hardware-decode pipeline for Jetson.
+            # GStreamer backend: try hardware-decode pipelines for Jetson.
             # When the api is 'gstreamer', ignore _auto_opencv_candidates and
-            # use nvjpegdec to offload MJPG decode from the ARM cores.
+            # offload MJPG decode from the ARM cores via nvv4l2decoder/nvjpegdec.
             if self.api == "gstreamer":
-                pipeline = self._build_gstreamer_pipeline()
-                cap = cv2.VideoCapture(pipeline, cv2.CAP_GSTREAMER)
-                if cap is not None and cap.isOpened():
-                    self.cap = cap
-                    self.actual_api = "gstreamer"
+                # OpenCV must be built with GStreamer support for CAP_GSTREAMER
+                # to work. The stock pip opencv-python wheel is NOT — Jetson needs
+                # the JetPack/apt OpenCV or a custom build with -D WITH_GSTREAMER=ON.
+                try:
+                    build_info = cv2.getBuildInformation()
+                    has_gst = "GStreamer" in build_info and "GStreamer:                   NO" not in build_info
+                except Exception:
+                    has_gst = True
+                if not has_gst:
+                    return CameraOpenResult(
+                        False,
+                        "This OpenCV build has no GStreamer support (likely the pip "
+                        "opencv-python wheel). Install the JetPack OpenCV (apt: python3-opencv "
+                        "/ nvidia-opencv) or rebuild OpenCV with WITH_GSTREAMER=ON to use the "
+                        "hardware nvjpegdec path.",
+                    )
+                attempts: list[str] = []
+                for label, pipeline in self._gstreamer_pipeline_candidates():
+                    cap = None
                     try:
-                        self.actual_width = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH) or self.width)
-                        self.actual_height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT) or self.height)
-                        self.actual_fps = float(cap.get(cv2.CAP_PROP_FPS) or self.fps)
-                        self.actual_fourcc = "MJPG→BGR"
+                        cap = cv2.VideoCapture(pipeline, cv2.CAP_GSTREAMER)
+                    except Exception as exc:
+                        attempts.append(f"{label}: exception {exc}")
+                        cap = None
+                    if cap is not None and cap.isOpened():
+                        # Confirm we can actually pull a frame before accepting.
+                        ok, _frame = cap.read()
+                        if ok:
+                            self.cap = cap
+                            self.actual_api = "gstreamer"
+                            try:
+                                self.actual_width = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH) or self.width)
+                                self.actual_height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT) or self.height)
+                                self.actual_fps = float(cap.get(cv2.CAP_PROP_FPS) or self.fps)
+                                self.actual_fourcc = "MJPG→BGR"
+                            except Exception:
+                                pass
+                            return CameraOpenResult(True, f"GStreamer [{label}] opened {self.actual_width}x{self.actual_height}@{self.actual_fps:.0f}fps")
+                        attempts.append(f"{label}: opened but first read failed")
+                    else:
+                        attempts.append(f"{label}: failed to open")
+                    try:
+                        if cap is not None:
+                            cap.release()
                     except Exception:
                         pass
-                    return CameraOpenResult(True, f"GStreamer (nvjpegdec) pipeline opened {self.actual_width}x{self.actual_height}@{self.actual_fps:.0f}fps")
-                try:
-                    if cap is not None:
-                        cap.release()
-                except Exception:
-                    pass
-                return CameraOpenResult(False, f"GStreamer pipeline failed to open. Ensure JetPack GStreamer and nvjpegdec are installed.\nPipeline: {pipeline}")
+                detail = "\n  ".join(attempts)
+                return CameraOpenResult(
+                    False,
+                    "All GStreamer hardware-decode pipelines failed. Check that JetPack "
+                    "GStreamer plugins are installed (gstreamer1.0-plugins-good, nvidia-l4t-gstreamer) "
+                    f"and the camera streams MJPG.\n  {detail}",
+                )
 
             if self.api == "auto":
                 candidates = _auto_opencv_candidates(self.source)
