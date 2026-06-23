@@ -865,11 +865,15 @@ class GstNativeCamera(BaseCamera):
 
     backend_name = "gstreamer"
 
-    def __init__(self, source: Any, width: int = 2592, height: int = 1944, fps: float = 30.0):
+    def __init__(self, source: Any, width: int = 2592, height: int = 1944, fps: float = 30.0,
+                 exposure_us: float = 0.0, gain: float = 0.0, exposure_auto: bool = True):
         self.source = source
         self.width = int(width or 2592)
         self.height = int(height or 1944)
         self.fps = float(fps or 30.0)
+        self.exposure_us = float(exposure_us or 0.0)
+        self.gain = float(gain or 0.0)
+        self.exposure_auto = bool(exposure_auto)
         self.actual_width = 0
         self.actual_height = 0
         self.actual_fps = self.fps
@@ -878,6 +882,7 @@ class GstNativeCamera(BaseCamera):
         self._appsink = None
         self._opened_label = ""
         self.last_error = ""
+        self.v4l2_control_log = ""
 
     @staticmethod
     def available() -> Tuple[bool, str]:
@@ -896,6 +901,51 @@ class GstNativeCamera(BaseCamera):
         if s.isdigit():
             return f"/dev/video{s}"
         return s or "/dev/video0"
+
+    def _apply_v4l2_controls(self) -> None:
+        """Set exposure/gain via v4l2-ctl on the device node.
+
+        GStreamer's v4l2src does not expose UVC exposure controls through the
+        pipeline reliably, and OpenCV's CAP_PROP path is not used by this
+        backend, so set them directly. UVC control names changed across kernel
+        versions, so try both the new (auto_exposure / exposure_time_absolute)
+        and old (exposure_auto / exposure_absolute) names; failures per control
+        are ignored. exposure_us is converted to V4L2's 100us units.
+        """
+        import subprocess
+        dev = self._device_node()
+        log_parts: list[str] = []
+
+        def _set(ctrl: str, value) -> bool:
+            try:
+                r = subprocess.run(
+                    ["v4l2-ctl", "-d", dev, "--set-ctrl", f"{ctrl}={value}"],
+                    capture_output=True, text=True, timeout=2.0,
+                )
+                ok = (r.returncode == 0)
+                log_parts.append(f"{ctrl}={value}:{'ok' if ok else 'fail'}")
+                return ok
+            except Exception as exc:
+                log_parts.append(f"{ctrl}={value}:err({exc})")
+                return False
+
+        if self.exposure_auto:
+            # 3 = aperture-priority (auto) on both old and new UVC control sets.
+            if not _set("auto_exposure", 3):
+                _set("exposure_auto", 3)
+        else:
+            # 1 = manual exposure mode.
+            if not _set("auto_exposure", 1):
+                _set("exposure_auto", 1)
+            if self.exposure_us > 0:
+                # V4L2 UVC exposure is in 100us units.
+                v = max(1, int(round(self.exposure_us / 100.0)))
+                if not _set("exposure_time_absolute", v):
+                    _set("exposure_absolute", v)
+        if self.gain > 0:
+            _set("gain", int(self.gain))
+
+        self.v4l2_control_log = "; ".join(log_parts)
 
     def _pipeline_candidates(self) -> list[tuple[str, str]]:
         dev = self._device_node()
@@ -995,9 +1045,15 @@ class GstNativeCamera(BaseCamera):
             self._pipeline = pipeline
             self._appsink = appsink
             self._opened_label = label
+            # Apply exposure/gain via v4l2-ctl now that the device is streaming.
+            try:
+                self._apply_v4l2_controls()
+            except Exception:
+                pass
+            ctrl = f" controls[{self.v4l2_control_log}]" if self.v4l2_control_log else ""
             return CameraOpenResult(
                 True,
-                f"GStreamer native [{label}] opened {self.actual_width}x{self.actual_height}@{self.actual_fps:.0f}fps",
+                f"GStreamer native [{label}] opened {self.actual_width}x{self.actual_height}@{self.actual_fps:.0f}fps{ctrl}",
             )
 
         detail = "\n  ".join(attempts)
@@ -1108,7 +1164,10 @@ def create_camera_backend(
         except Exception:
             cv_has_gst = False
         if not cv_has_gst:
-            return GstNativeCamera(parse_source(source_text), width, height, fps)
+            return GstNativeCamera(
+                parse_source(source_text), width, height, fps,
+                exposure_us=exposure_us, gain=gain, exposure_auto=exposure_auto,
+            )
     return OpenCVCamera(parse_source(source_text), width, height, fps, api=opencv_api)
 
 
