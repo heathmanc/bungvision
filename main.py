@@ -45,7 +45,7 @@ from PySide6.QtWidgets import (
 
 from camera_backend import BaslerPylonCamera, create_camera_backend, list_basler_cameras
 
-APP_TITLE = "BungVision Python Line-Side HMI v0.9.96 Native GStreamer Capture"
+APP_TITLE = "BungVision Python Line-Side HMI v0.9.97 GStreamer Auto-Exposure"
 ROOT = Path(__file__).resolve().parent
 LOG_DIR = ROOT / "logs"
 FAIL_DIR = ROOT / "fail_snapshots"
@@ -4857,6 +4857,13 @@ class MainWindow(QMainWindow):
         self.close_camera(reset_session=False)
         self.reset_runtime_session(reset_counts=False)
         backend = str(getattr(self, "camera_backend", "opencv")).lower()
+        # The manual exposure settings in Settings are Basler-scoped (default
+        # 5000us). For UVC/USB cameras driven via OpenCV/GStreamer there is no
+        # exposure UI, so default those backends to auto-exposure; otherwise the
+        # 5000us manual value yields a very dark image.
+        cam_exposure_auto = bool(getattr(self, "basler_exposure_auto", False))
+        if backend not in ("basler", "pylon", "basler/pylon"):
+            cam_exposure_auto = True
         self.cap = create_camera_backend(
             backend=backend,
             source_text=self.source_edit.text() if hasattr(self, "source_edit") else "0",
@@ -4866,7 +4873,7 @@ class MainWindow(QMainWindow):
             fps=float(getattr(self, "camera_fps", 30.0)),
             exposure_us=float(getattr(self, "basler_exposure_us", 5000.0)),
             gain=float(getattr(self, "basler_gain", 0.0)),
-            exposure_auto=bool(getattr(self, "basler_exposure_auto", False)),
+            exposure_auto=cam_exposure_auto,
             opencv_api=str(getattr(self, "opencv_api", "auto")),
             basler_roi_enabled=bool(getattr(self, "basler_roi_enabled", False)),
             basler_roi_offset_x=int(getattr(self, "basler_roi_offset_x", 0)),
