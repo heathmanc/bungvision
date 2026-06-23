@@ -45,7 +45,7 @@ from PySide6.QtWidgets import (
 
 from camera_backend import BaslerPylonCamera, create_camera_backend, list_basler_cameras
 
-APP_TITLE = "BungVision Python Line-Side HMI v0.9.97 GStreamer Auto-Exposure"
+APP_TITLE = "BungVision Python Line-Side HMI v0.9.98 Reset-Reject Fix"
 ROOT = Path(__file__).resolve().parent
 LOG_DIR = ROOT / "logs"
 FAIL_DIR = ROOT / "fail_snapshots"
@@ -3956,9 +3956,18 @@ class MainWindow(QMainWindow):
         self.settings_btn.clicked.connect(lambda _checked=False: self.open_settings_dialog())
         self.load_btn = QPushButton("Load Model")
         self.load_btn.clicked.connect(lambda _checked=False: self.load_model())
-        self.reset_reject_btn = QPushButton("Reset Reject")
+        self.reset_reject_btn = QPushButton("Override Reject")
+        self.reset_reject_btn.setToolTip(
+            "Clear the current reject latch and subtract 1 from the fail count.\n"
+            "Use when the vision system issued a false reject or you have physically\n"
+            "removed the part and do not want it counted as a production reject."
+        )
         self.reset_reject_btn.clicked.connect(lambda _checked=False: self.reset_reject_latch())
         self.reset_btn = QPushButton("Reset Counts")
+        self.reset_btn.setToolTip(
+            "Reset all session counters (pass, fail, total) to zero and clear any\n"
+            "active reject latch. Use at shift start or after a mode change."
+        )
         self.reset_btn.clicked.connect(lambda _checked=False: self.reset_counts())
         self.summary_btn = QPushButton("Production Summary")
         self.summary_btn.setToolTip("Open the read-only production summary: session, today, last 7 days, reject breakdown, and by-hour throughput.")
@@ -5179,6 +5188,12 @@ class MainWindow(QMainWindow):
         self.mode_pill.set_tone("warn" if self.demo_mode else "pass")
 
     def reset_reject_latch(self):
+        # Only un-count if there was actually a latched reject from a committed FAIL.
+        if self.reject_latched and int(getattr(self, "fail_count", 0)) > 0:
+            self.fail_count = int(self.fail_count) - 1
+            self.total_count = max(0, int(getattr(self, "total_count", 0)) - 1)
+            self.log("Override: fail count decremented (operator override of last reject).")
+
         self.reject_latched = False
         self.reject_latch_id = 0
         self.reject_latch_reason = ""
@@ -5188,7 +5203,7 @@ class MainWindow(QMainWindow):
         self.update_status_pills(self.last_result)
         if hasattr(self, "decision_label") and (not self.last_result or self.last_result.status != "FAIL"):
             self.decision_label.setText("READY")
-            self.reason_label.setText("Reject latch cleared.")
+            self.reason_label.setText("Reject overridden; fail count corrected.")
         self.log("Reject latch cleared; PLC reset pulse sent.")
 
     def latch_reject(self, grade: BatteryGrade):
