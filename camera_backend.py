@@ -142,20 +142,64 @@ class OpenCVCamera(BaseCamera):
         self.fps = float(fps or 0.0)
         self.api = normalize_opencv_api(api)
         self.actual_api = ""
+        self.actual_width = 0
+        self.actual_height = 0
+        self.actual_fps = 0.0
+        self.actual_fourcc = ""
         self.cap: Optional[cv2.VideoCapture] = None
+
+    def _fourcc_str(self, code: float) -> str:
+        try:
+            c = int(code)
+            return "".join(chr((c >> (i * 8)) & 0xFF) for i in range(4)).strip("\x00")
+        except Exception:
+            return ""
 
     def _configure_capture(self) -> None:
         if self.cap is None:
             return
         try:
             self.cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)
-            self.cap.set(cv2.CAP_PROP_FOURCC, cv2.VideoWriter_fourcc(*"MJPG"))
-            if self.width > 0:
+        except Exception:
+            pass
+        # Only request MJPG if the camera reports it can do the requested FPS
+        # at the requested resolution. Forcing MJPG on cameras that don't
+        # support it properly causes dark/corrupt frames. Try MJPG first; if
+        # the resulting FPS drops significantly below the request, fall back to
+        # the camera's native format.
+        if self.width > 0:
+            try:
                 self.cap.set(cv2.CAP_PROP_FRAME_WIDTH, self.width)
-            if self.height > 0:
+            except Exception:
+                pass
+        if self.height > 0:
+            try:
                 self.cap.set(cv2.CAP_PROP_FRAME_HEIGHT, self.height)
-            if self.fps > 0:
+            except Exception:
+                pass
+        if self.fps > 0:
+            try:
                 self.cap.set(cv2.CAP_PROP_FPS, self.fps)
+            except Exception:
+                pass
+        # Try MJPG to get higher FPS; revert if the camera doesn't support it
+        # (indicated by a large FPS drop after setting the fourcc).
+        try:
+            fps_before = float(self.cap.get(cv2.CAP_PROP_FPS) or 0.0)
+            self.cap.set(cv2.CAP_PROP_FOURCC, cv2.VideoWriter_fourcc(*"MJPG"))
+            fps_after = float(self.cap.get(cv2.CAP_PROP_FPS) or 0.0)
+            # If FPS dropped to nearly zero or halved after forcing MJPG,
+            # revert to the camera's native format (YUYV/BGR3/etc.).
+            if fps_after > 0 and fps_before > 0 and fps_after < fps_before * 0.5:
+                self.cap.set(cv2.CAP_PROP_FOURCC, cv2.VideoWriter_fourcc(*"YUYV"))
+        except Exception:
+            pass
+        # Read back what the driver actually accepted.
+        try:
+            self.actual_width = int(self.cap.get(cv2.CAP_PROP_FRAME_WIDTH) or 0)
+            self.actual_height = int(self.cap.get(cv2.CAP_PROP_FRAME_HEIGHT) or 0)
+            self.actual_fps = float(self.cap.get(cv2.CAP_PROP_FPS) or 0.0)
+            self.actual_fourcc = self._fourcc_str(self.cap.get(cv2.CAP_PROP_FOURCC))
         except Exception:
             pass
 
@@ -177,7 +221,12 @@ class OpenCVCamera(BaseCamera):
                     self.cap = cap
                     self.actual_api = api_name
                     self._configure_capture()
-                    return CameraOpenResult(True, f"OpenCV camera opened: {self.source} via {_opencv_api_label(api_name)}")
+                    diag = (
+                        f" actual={self.actual_width}x{self.actual_height}"
+                        f"@{self.actual_fps:.0f}fps"
+                        f" fmt={self.actual_fourcc or 'unknown'}"
+                    )
+                    return CameraOpenResult(True, f"OpenCV camera opened: {self.source} via {_opencv_api_label(api_name)}.{diag}")
                 try:
                     if cap is not None:
                         cap.release()
@@ -223,6 +272,8 @@ class OpenCVCamera(BaseCamera):
 
     def description(self) -> str:
         api = _opencv_api_label(self.actual_api or self.api)
+        if self.actual_width and self.actual_height:
+            return f"OpenCV:{self.source} ({api}) {self.actual_width}x{self.actual_height}@{self.actual_fps:.0f}fps {self.actual_fourcc or ''}".strip()
         return f"OpenCV:{self.source} ({api})"
 
 
@@ -526,21 +577,41 @@ class BaslerPylonCamera(BaseCamera):
             return CameraOpenResult(False, f"Basler/Pylon camera error: {exc}")
 
     def _try_restart_grabbing(self) -> bool:
-        """Attempt to restart the Basler grab loop after a stall or stop event."""
+        """Attempt to recover after a grab stall or USB disconnect.
+
+        A simple StartGrabbing() call is sufficient for soft stalls. For USB
+        removal events ('Device has been removed') the camera object is invalid
+        and a full re-open (release + open) is required instead.
+        """
+        # First try the cheap path: just restart the grab loop.
         try:
-            if self.camera is None or not self.camera.IsOpen():
-                return False
-            if self.camera.IsGrabbing():
-                self.camera.StopGrabbing()
+            if self.camera is not None and self.camera.IsOpen():
+                if self.camera.IsGrabbing():
+                    self.camera.StopGrabbing()
+                self.camera.StartGrabbing(self._pylon.GrabStrategy_LatestImageOnly)
+                self._grab_restart_count += 1
+                self.last_grab_error = f"grab restarted (restart #{self._grab_restart_count})"
+                return True
+        except Exception:
+            pass
+
+        # Cheap path failed — device likely disconnected. Release fully and
+        # re-open (re-enumerates USB/GigE, creates a new InstantCamera).
+        try:
+            self.release()
         except Exception:
             pass
         try:
-            self.camera.StartGrabbing(self._pylon.GrabStrategy_LatestImageOnly)
-            self._grab_restart_count += 1
-            self.last_grab_error = f"grab restarted (restart #{self._grab_restart_count})"
-            return True
+            result = self.open()
+            if result.ok:
+                self._grab_restart_count += 1
+                self.last_grab_error = f"device re-opened after disconnect (restart #{self._grab_restart_count})"
+                return True
+            else:
+                self.last_grab_error = f"device re-open failed: {result.message}"
+                return False
         except Exception as exc:
-            self.last_grab_error = f"grab restart failed: {exc}"
+            self.last_grab_error = f"device re-open exception: {exc}"
             return False
 
     def read(self) -> Tuple[bool, Optional[np.ndarray]]:
