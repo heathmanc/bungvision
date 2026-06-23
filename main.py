@@ -45,7 +45,7 @@ from PySide6.QtWidgets import (
 
 from camera_backend import BaslerPylonCamera, create_camera_backend, list_basler_cameras
 
-APP_TITLE = "BungVision Python Line-Side HMI v0.9.94 GStreamer nvjpegdec + Auto-Exposure"
+APP_TITLE = "BungVision Python Line-Side HMI v0.9.95 GStreamer HW Decode Fallbacks"
 ROOT = Path(__file__).resolve().parent
 LOG_DIR = ROOT / "logs"
 FAIL_DIR = ROOT / "fail_snapshots"
