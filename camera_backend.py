@@ -194,6 +194,13 @@ class OpenCVCamera(BaseCamera):
                 self.cap.set(cv2.CAP_PROP_FOURCC, cv2.VideoWriter_fourcc(*"YUYV"))
         except Exception:
             pass
+        # Enable auto-exposure so the camera isn't dark on first open.
+        # CAP_PROP_AUTO_EXPOSURE: 0.25 = manual, 0.75 = auto (V4L2 convention).
+        # Silently ignored on cameras/drivers that don't support it.
+        try:
+            self.cap.set(cv2.CAP_PROP_AUTO_EXPOSURE, 0.75)
+        except Exception:
+            pass
         # Read back what the driver actually accepted.
         try:
             self.actual_width = int(self.cap.get(cv2.CAP_PROP_FRAME_WIDTH) or 0)

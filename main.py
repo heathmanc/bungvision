@@ -45,7 +45,7 @@ from PySide6.QtWidgets import (
 
 from camera_backend import BaslerPylonCamera, create_camera_backend, list_basler_cameras
 
-APP_TITLE = "BungVision Python Line-Side HMI v0.9.94 OpenCV Camera Fixes"
+APP_TITLE = "BungVision Python Line-Side HMI v0.9.94 OpenCV FPS and Exposure Fixes"
 ROOT = Path(__file__).resolve().parent
 LOG_DIR = ROOT / "logs"
 FAIL_DIR = ROOT / "fail_snapshots"
@@ -2487,7 +2487,22 @@ class InferenceWorker:
             detections: List[Detection] = []
             error = ""
             try:
-                detections = self.model_runner.predict(packet.frame, conf, iou, imgsz, device)
+                # Pre-resize large frames to imgsz before calling predict() so
+                # YOLO's internal letterbox preprocessing is a near-no-op.
+                # On a 5MP (2592x1944) source, the letterbox step inside YOLO
+                # takes 30-40ms on CPU, capping inference at 15fps even though
+                # TensorRT only needs 20ms. Resizing here with cv2 (which uses
+                # INTER_AREA for shrink) is much faster and the accuracy loss
+                # is negligible because YOLO will letterbox to exactly imgsz anyway.
+                infer_frame = packet.frame
+                if imgsz > 0:
+                    fh, fw = infer_frame.shape[:2]
+                    if fw > imgsz or fh > imgsz:
+                        scale = imgsz / max(fw, fh)
+                        new_w = max(1, int(fw * scale))
+                        new_h = max(1, int(fh * scale))
+                        infer_frame = cv2.resize(infer_frame, (new_w, new_h), interpolation=cv2.INTER_AREA)
+                detections = self.model_runner.predict(infer_frame, conf, iou, imgsz, device)
             except Exception:
                 error = traceback.format_exc()
                 if self.log_cb:
