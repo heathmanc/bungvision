@@ -851,6 +851,221 @@ class BaslerPylonCamera(BaseCamera):
         return "Basler/Pylon"
 
 
+class GstNativeCamera(BaseCamera):
+    """Native GStreamer capture via python-gi (PyGObject) + appsink.
+
+    This backend talks to GStreamer directly instead of through OpenCV's
+    VideoCapture, so it works even when OpenCV was built WITHOUT GStreamer
+    support (the common pip opencv-python wheel reports 'GStreamer: NO').
+
+    It uses the Jetson hardware MJPG decoder (nvv4l2decoder/nvjpegdec) to
+    offload JPEG decode from the ARM cores, removing the ~15fps software-decode
+    ceiling on full-resolution (5MP) USB cameras.
+    """
+
+    backend_name = "gstreamer"
+
+    def __init__(self, source: Any, width: int = 2592, height: int = 1944, fps: float = 30.0):
+        self.source = source
+        self.width = int(width or 2592)
+        self.height = int(height or 1944)
+        self.fps = float(fps or 30.0)
+        self.actual_width = 0
+        self.actual_height = 0
+        self.actual_fps = self.fps
+        self._Gst = None
+        self._pipeline = None
+        self._appsink = None
+        self._opened_label = ""
+        self.last_error = ""
+
+    @staticmethod
+    def available() -> Tuple[bool, str]:
+        try:
+            import gi  # noqa: F401
+            gi.require_version("Gst", "1.0")
+            from gi.repository import Gst  # noqa: F401
+            return True, "python-gi available"
+        except Exception as exc:
+            return False, str(exc)
+
+    def _device_node(self) -> str:
+        if isinstance(self.source, int):
+            return f"/dev/video{self.source}"
+        s = str(self.source or "").strip()
+        if s.isdigit():
+            return f"/dev/video{s}"
+        return s or "/dev/video0"
+
+    def _pipeline_candidates(self) -> list[tuple[str, str]]:
+        dev = self._device_node()
+        w, h, fps = self.width, self.height, int(self.fps or 30)
+        caps = f"image/jpeg,width={w},height={h},framerate={fps}/1"
+        # appsink delivers BGR frames; drop+max-buffers=1 keeps latency low.
+        sink = "appsink name=sink emit-signals=false max-buffers=1 drop=true sync=false"
+        return [
+            (
+                "nvv4l2decoder",
+                f"v4l2src device={dev} io-mode=2 ! {caps} ! jpegparse ! "
+                f"nvv4l2decoder mjpeg=1 ! nvvidconv ! video/x-raw,format=BGRx ! "
+                f"videoconvert ! video/x-raw,format=BGR ! {sink}",
+            ),
+            (
+                "nvjpegdec+nvvidconv",
+                f"v4l2src device={dev} ! {caps} ! nvjpegdec ! "
+                f"nvvidconv ! video/x-raw,format=BGRx ! "
+                f"videoconvert ! video/x-raw,format=BGR ! {sink}",
+            ),
+            (
+                "nvjpegdec",
+                f"v4l2src device={dev} ! {caps} ! nvjpegdec ! "
+                f"video/x-raw ! videoconvert ! video/x-raw,format=BGR ! {sink}",
+            ),
+            (
+                "jpegdec (CPU)",
+                f"v4l2src device={dev} ! {caps} ! jpegdec ! "
+                f"videoconvert ! video/x-raw,format=BGR ! {sink}",
+            ),
+        ]
+
+    def open(self) -> CameraOpenResult:
+        ok, msg = self.available()
+        if not ok:
+            return CameraOpenResult(
+                False,
+                "GStreamer backend selected but python-gi (PyGObject) is not available: "
+                f"{msg}\nInstall with: sudo apt install python3-gi python3-gi-cairo gir1.2-gstreamer-1.0",
+            )
+        import gi
+        gi.require_version("Gst", "1.0")
+        from gi.repository import Gst
+        if not Gst.is_initialized():
+            Gst.init(None)
+        self._Gst = Gst
+
+        attempts: list[str] = []
+        for label, pipeline_str in self._pipeline_candidates():
+            pipeline = None
+            try:
+                pipeline = Gst.parse_launch(pipeline_str)
+            except Exception as exc:
+                attempts.append(f"{label}: parse error {exc}")
+                continue
+            appsink = pipeline.get_by_name("sink")
+            if appsink is None:
+                attempts.append(f"{label}: no appsink")
+                try:
+                    pipeline.set_state(Gst.State.NULL)
+                except Exception:
+                    pass
+                continue
+            ret = pipeline.set_state(Gst.State.PLAYING)
+            if ret == Gst.StateChangeReturn.FAILURE:
+                attempts.append(f"{label}: set_state PLAYING failed")
+                try:
+                    pipeline.set_state(Gst.State.NULL)
+                except Exception:
+                    pass
+                continue
+            # Wait for the pipeline to reach PLAYING and pull one sample to confirm.
+            sample = None
+            try:
+                sample = appsink.emit("try-pull-sample", 5 * Gst.SECOND)
+            except Exception as exc:
+                attempts.append(f"{label}: try-pull-sample error {exc}")
+            if sample is None:
+                attempts.append(f"{label}: no sample within 5s")
+                try:
+                    pipeline.set_state(Gst.State.NULL)
+                except Exception:
+                    pass
+                continue
+            # Success — record actual caps from the first sample.
+            try:
+                caps = sample.get_caps()
+                st = caps.get_structure(0)
+                self.actual_width = int(st.get_value("width"))
+                self.actual_height = int(st.get_value("height"))
+                fr = st.get_fraction("framerate")
+                if fr is not None and len(fr) >= 3 and fr[2]:
+                    self.actual_fps = float(fr[1]) / float(fr[2])
+            except Exception:
+                self.actual_width = self.width
+                self.actual_height = self.height
+            self._pipeline = pipeline
+            self._appsink = appsink
+            self._opened_label = label
+            return CameraOpenResult(
+                True,
+                f"GStreamer native [{label}] opened {self.actual_width}x{self.actual_height}@{self.actual_fps:.0f}fps",
+            )
+
+        detail = "\n  ".join(attempts)
+        return CameraOpenResult(False, f"All native GStreamer pipelines failed.\n  {detail}")
+
+    def read(self) -> Tuple[bool, Optional[np.ndarray]]:
+        if self._appsink is None or self._Gst is None:
+            return False, None
+        Gst = self._Gst
+        try:
+            sample = self._appsink.emit("try-pull-sample", 1 * Gst.SECOND)
+        except Exception as exc:
+            self.last_error = f"pull-sample error: {exc}"
+            return False, None
+        if sample is None:
+            self.last_error = "no sample (timeout)"
+            return False, None
+        try:
+            buf = sample.get_buffer()
+            caps = sample.get_caps()
+            st = caps.get_structure(0)
+            w = int(st.get_value("width"))
+            h = int(st.get_value("height"))
+            ok, mapinfo = buf.map(Gst.MapFlags.READ)
+            if not ok:
+                self.last_error = "buffer map failed"
+                return False, None
+            try:
+                # BGR is 3 bytes/pixel. Copy out before unmapping the buffer.
+                frame = np.frombuffer(mapinfo.data, dtype=np.uint8)
+                expected = w * h * 3
+                if frame.size < expected:
+                    self.last_error = f"short buffer {frame.size} < {expected}"
+                    return False, None
+                frame = frame[:expected].reshape((h, w, 3)).copy()
+            finally:
+                buf.unmap(mapinfo)
+            self.last_error = ""
+            return True, frame
+        except Exception as exc:
+            self.last_error = f"read exception: {exc}"
+            return False, None
+
+    def release(self) -> None:
+        try:
+            if self._pipeline is not None and self._Gst is not None:
+                self._pipeline.set_state(self._Gst.State.NULL)
+        except Exception:
+            pass
+        self._pipeline = None
+        self._appsink = None
+
+    def is_opened(self) -> bool:
+        return bool(self._pipeline is not None and self._appsink is not None)
+
+    def get(self, prop: int) -> float:
+        if prop == cv2.CAP_PROP_FRAME_WIDTH:
+            return float(self.actual_width or self.width)
+        if prop == cv2.CAP_PROP_FRAME_HEIGHT:
+            return float(self.actual_height or self.height)
+        if prop == cv2.CAP_PROP_FPS:
+            return float(self.actual_fps or self.fps)
+        return 0.0
+
+    def description(self) -> str:
+        return f"GStreamer:{self._device_node()} [{self._opened_label}] {self.actual_width}x{self.actual_height}@{self.actual_fps:.0f}fps".strip()
+
+
 def create_camera_backend(
     backend: str,
     source_text: str = "0",
@@ -884,6 +1099,16 @@ def create_camera_backend(
             basler_roi_width,
             basler_roi_height,
         )
+    # When the user selects GStreamer and OpenCV has no GStreamer support
+    # (the common pip opencv-python wheel), use the native python-gi backend
+    # which drives GStreamer directly and works regardless of the OpenCV build.
+    if normalize_opencv_api(opencv_api) == "gstreamer":
+        try:
+            cv_has_gst = "GStreamer:                   NO" not in cv2.getBuildInformation()
+        except Exception:
+            cv_has_gst = False
+        if not cv_has_gst:
+            return GstNativeCamera(parse_source(source_text), width, height, fps)
     return OpenCVCamera(parse_source(source_text), width, height, fps, api=opencv_api)
 
 
