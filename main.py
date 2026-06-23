@@ -45,7 +45,7 @@ from PySide6.QtWidgets import (
 
 from camera_backend import BaslerPylonCamera, create_camera_backend, list_basler_cameras
 
-APP_TITLE = "BungVision Python Line-Side HMI v0.9.94 OpenCV FPS and Exposure Fixes"
+APP_TITLE = "BungVision Python Line-Side HMI v0.9.94 GStreamer nvjpegdec + Auto-Exposure"
 ROOT = Path(__file__).resolve().parent
 LOG_DIR = ROOT / "logs"
 FAIL_DIR = ROOT / "fail_snapshots"
@@ -2487,22 +2487,7 @@ class InferenceWorker:
             detections: List[Detection] = []
             error = ""
             try:
-                # Pre-resize large frames to imgsz before calling predict() so
-                # YOLO's internal letterbox preprocessing is a near-no-op.
-                # On a 5MP (2592x1944) source, the letterbox step inside YOLO
-                # takes 30-40ms on CPU, capping inference at 15fps even though
-                # TensorRT only needs 20ms. Resizing here with cv2 (which uses
-                # INTER_AREA for shrink) is much faster and the accuracy loss
-                # is negligible because YOLO will letterbox to exactly imgsz anyway.
-                infer_frame = packet.frame
-                if imgsz > 0:
-                    fh, fw = infer_frame.shape[:2]
-                    if fw > imgsz or fh > imgsz:
-                        scale = imgsz / max(fw, fh)
-                        new_w = max(1, int(fw * scale))
-                        new_h = max(1, int(fh * scale))
-                        infer_frame = cv2.resize(infer_frame, (new_w, new_h), interpolation=cv2.INTER_AREA)
-                detections = self.model_runner.predict(infer_frame, conf, iou, imgsz, device)
+                detections = self.model_runner.predict(packet.frame, conf, iou, imgsz, device)
             except Exception:
                 error = traceback.format_exc()
                 if self.log_cb:
@@ -2892,7 +2877,7 @@ class SettingsDialog(QDialog):
         self.yolo_iou_spin_local = self._spin(45, 1, 99, 1)
         self._add_grid_row(rgrid, 0, 0, "Backend", self.camera_backend_local, "OpenCV for USB/UVC/video paths. Basler/Pylon uses the native pypylon grab loop.")
         self._add_grid_row(rgrid, 0, 1, "OpenCV Src", self.source_edit_local, "Camera index or video path. Used only by the OpenCV backend.")
-        self._add_grid_row(rgrid, 1, 0, "OpenCV API", self.opencv_api_local, "Auto tries the best platform backend. Windows can use DirectShow/MSMF; Jetson/Linux normally uses V4L2. Use GStreamer for pipeline strings.")
+        self._add_grid_row(rgrid, 1, 0, "OpenCV API", self.opencv_api_local, "Auto/V4L2: software MJPG decode (~15fps at 5MP on Jetson). GStreamer: uses nvjpegdec for hardware MJPG decode — recommended for full-res USB cameras on Jetson AGX/NX (enables 30fps at 2592x1944).")
         self._add_grid_row(rgrid, 1, 1, "Basler SN", self.basler_serial_local, "Optional Basler serial number. Leave blank to use the first detected Basler camera.")
         self._add_grid_row(rgrid, 2, 0, "Cam FPS", self.camera_fps_local, "Requested camera frame rate. Actual value depends on camera and exposure.")
         self._add_grid_row(rgrid, 2, 1, "Width", self.camera_width_local, "Requested camera width in pixels.")
