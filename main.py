@@ -45,7 +45,7 @@ from PySide6.QtWidgets import (
 
 from camera_backend import BaslerPylonCamera, create_camera_backend, list_basler_cameras
 
-APP_TITLE = "BungVision Python Line-Side HMI v0.9.97 GStreamer Auto-Exposure"
+APP_TITLE = "BungVision Python Line-Side HMI v0.9.98 Button Tooltips"
 ROOT = Path(__file__).resolve().parent
 LOG_DIR = ROOT / "logs"
 FAIL_DIR = ROOT / "fail_snapshots"
@@ -3957,8 +3957,18 @@ class MainWindow(QMainWindow):
         self.load_btn = QPushButton("Load Model")
         self.load_btn.clicked.connect(lambda _checked=False: self.load_model())
         self.reset_reject_btn = QPushButton("Reset Reject")
+        self.reset_reject_btn.setToolTip(
+            "Clear the PLC reject latch so the system resumes inspection.\n"
+            "Operator must fix the part, then press this — the system will\n"
+            "re-inspect and must find it good before the line continues.\n"
+            "Fail count is preserved (the system recorded a catch)."
+        )
         self.reset_reject_btn.clicked.connect(lambda _checked=False: self.reset_reject_latch())
         self.reset_btn = QPushButton("Reset Counts")
+        self.reset_btn.setToolTip(
+            "Reset shift/product counters (pass, fail, total) to zero.\n"
+            "Use at shift start or product changeover only."
+        )
         self.reset_btn.clicked.connect(lambda _checked=False: self.reset_counts())
         self.summary_btn = QPushButton("Production Summary")
         self.summary_btn.setToolTip("Open the read-only production summary: session, today, last 7 days, reject breakdown, and by-hour throughput.")
@@ -5188,7 +5198,7 @@ class MainWindow(QMainWindow):
         self.update_status_pills(self.last_result)
         if hasattr(self, "decision_label") and (not self.last_result or self.last_result.status != "FAIL"):
             self.decision_label.setText("READY")
-            self.reason_label.setText("Reject latch cleared.")
+            self.reason_label.setText("Reject latch cleared. Fix part and re-run.")
         self.log("Reject latch cleared; PLC reset pulse sent.")
 
     def latch_reject(self, grade: BatteryGrade):
