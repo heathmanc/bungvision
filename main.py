@@ -45,7 +45,7 @@ from PySide6.QtWidgets import (
 
 from camera_backend import BaslerPylonCamera, create_camera_backend, list_basler_cameras
 
-APP_TITLE = "BungVision Python Line-Side HMI v0.9.98 Reset-Reject Reinspect"
+APP_TITLE = "BungVision Python Line-Side HMI v0.9.99 Pylogix Import Diagnostics"
 ROOT = Path(__file__).resolve().parent
 LOG_DIR = ROOT / "logs"
 FAIL_DIR = ROOT / "fail_snapshots"
@@ -763,8 +763,20 @@ class PLCInterface:
                 from pylogix import PLC  # type: ignore
                 self._PLC = PLC
             except Exception as e:
-                self._last_error = str(e)
-                return None, "pylogix not installed"
+                # Surface the REAL import error and the interpreter in use.
+                # "pylogix not installed" alone is misleading: the package may be
+                # present for a different Python (e.g. user-site for python3.10
+                # while the app runs under another interpreter), or pylogix may
+                # fail to import due to a missing sub-dependency.
+                import sys
+                detail = f"{type(e).__name__}: {e}"
+                self._last_error = (
+                    f"pylogix import failed ({detail}); "
+                    f"python={sys.executable}; "
+                    f"sys.path[0]={sys.path[0] if sys.path else '?'}"
+                )
+                _write_debug_log(f"PYLOGIX_IMPORT_ERROR {self._last_error}")
+                return None, self._last_error
         if self._comm is None:
             try:
                 self._comm = self._PLC()
