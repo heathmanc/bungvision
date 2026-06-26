@@ -45,7 +45,7 @@ from PySide6.QtWidgets import (
 
 from camera_backend import BaslerPylonCamera, create_camera_backend, list_basler_cameras
 
-APP_TITLE = "BungVision Python Line-Side HMI v0.9.99 Pylogix Import Diagnostics"
+APP_TITLE = "BungVision Python Line-Side HMI v0.9.100 PLC Reset Input"
 ROOT = Path(__file__).resolve().parent
 LOG_DIR = ROOT / "logs"
 FAIL_DIR = ROOT / "fail_snapshots"
@@ -683,6 +683,12 @@ PLC_TAG_DEFAULTS = {
         "BungVision_Reset",
         "BOOL output. Momentary pulse when Reset Counts is pressed from the HMI.",
     ),
+    "reset_request": (
+        "BungVision_ResetRequest",
+        "BOOL INPUT. PLC sets this TRUE to ask BungVision to clear its reject "
+        "latch and resume inspection (same action as the Reset Reject button). "
+        "BungVision acts on the rising edge and does not write this tag.",
+    ),
 }
 PLC_TAG_LONG_DESCRIPTIONS = {
     "running": (
@@ -719,6 +725,13 @@ PLC_TAG_LONG_DESCRIPTIONS = {
         "Reset acknowledgement pulse",
         "Momentary TRUE pulse when Reset is pressed in BungVision. Use it to clear or acknowledge "
         "PLC-side vision stop/alarm logic if desired."
+    ),
+    "reset_request": (
+        "Reset request (PLC -> Vision input)",
+        "BOOL INPUT written by the PLC. Set it TRUE to ask BungVision to clear its reject latch and "
+        "resume inspection (identical to pressing Reset Reject on the HMI). BungVision polls this tag "
+        "and acts on the rising edge; it never writes this tag. Return it to FALSE after the edge so a "
+        "later TRUE can trigger another reset."
     ),
 }
 
@@ -871,6 +884,30 @@ class PLCInterface:
             self.close()
             return self._last_status
 
+    def read_bool(self, tag: str) -> Tuple[Optional[bool], str]:
+        """Read a single BOOL tag. Returns (value, "") on success or (None, error)."""
+        if not self.enabled:
+            return None, "SIM"
+        if not tag:
+            return None, "no tag"
+        comm, msg = self._ensure_comm()
+        if comm is None:
+            return None, msg
+        try:
+            response = comm.Read(tag)
+            err = self._response_error(response, tag)
+            if err:
+                self._last_error = f"{tag}: {err}"
+                return None, err
+            value = getattr(response, "Value", response)
+            if isinstance(value, (list, tuple)):
+                value = value[0] if value else None
+            return (bool(value) if value is not None else None), ""
+        except Exception as e:
+            self._last_error = str(e)
+            self.close()
+            return None, str(e)
+
     def close(self) -> None:
         if self._comm is not None:
             try:
@@ -910,6 +947,10 @@ class AsyncPLCWriter:
             "reset": False,
         }
         self._reset_pulse_until = 0.0
+        # PLC -> Vision reset request input (rising-edge detected).
+        self._reset_request_prev = False
+        self._reset_request_pending = False
+        self._last_reset_poll_t = 0.0
         self._heartbeat = False
         self._last_heartbeat_t = 0.0
         self._last_write_t = 0.0
@@ -975,6 +1016,29 @@ class AsyncPLCWriter:
         with self._lock:
             return self._last_status, self._last_error, bool(self._heartbeat)
 
+    def take_reset_request(self) -> bool:
+        """Return True once per PLC reset rising edge, then clear the flag."""
+        with self._lock:
+            pending = self._reset_request_pending
+            self._reset_request_pending = False
+            return bool(pending)
+
+    def _poll_reset_request(self, enabled: bool, tags: dict) -> None:
+        """Read the PLC reset-request input and latch a pending flag on rising edge."""
+        tag = (tags or {}).get("reset_request", "")
+        if not enabled or not tag:
+            self._reset_request_prev = False
+            return
+        value, err = self._plc.read_bool(tag)
+        if err or value is None:
+            # Don't spam status with read errors; keep prev unchanged so a
+            # transient read failure doesn't fabricate an edge.
+            return
+        if value and not self._reset_request_prev:
+            with self._lock:
+                self._reset_request_pending = True
+        self._reset_request_prev = bool(value)
+
     def _snapshot(self) -> Tuple[bool, str, dict, int, Dict[str, bool]]:
         now = time.perf_counter()
         with self._lock:
@@ -1023,6 +1087,15 @@ class AsyncPLCWriter:
                     self._last_status = status
                     self._last_error = getattr(self._plc, "_last_error", "")
                 self._last_write_t = now
+
+            # Poll the PLC reset-request input at ~10 Hz (independent of writes).
+            if (now - self._last_reset_poll_t) >= 0.10:
+                self._last_reset_poll_t = now
+                try:
+                    self._poll_reset_request(enabled, tags)
+                except Exception as e:
+                    with self._lock:
+                        self._last_error = f"reset poll: {e}"
 
             # Wake sooner for reset/config changes, otherwise tick lightly.
             self._wake.wait(0.05)
@@ -6437,6 +6510,13 @@ class MainWindow(QMainWindow):
         # pulse_plc_reset() and held by the writer, so they cannot be missed.
         if now_loop - float(getattr(self, "_last_metrics_ui_update_t", 0.0) or 0.0) >= 0.10:
             self._last_metrics_ui_update_t = now_loop
+            # Act on a PLC-initiated reset request (rising edge) before refreshing
+            # outputs. This mirrors the Reset Reject button but is driven by the PLC.
+            writer = getattr(self, "plc_writer", None)
+            if writer is not None and writer.take_reset_request():
+                if getattr(self, "reject_latched", False):
+                    self.log("PLC reset request received; clearing reject latch.")
+                    self.reset_reject_latch()
             self.update_plc_outputs(self.last_result)
             self.update_metrics(fps=self.fps)
             self.update_status_pills(self.last_result)
