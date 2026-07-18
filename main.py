@@ -3981,12 +3981,15 @@ class MainWindow(QMainWindow):
         side.setContentsMargins(0, 0, 0, 0)
         side.setSpacing(5)
         side_widget.setStyleSheet(
-            "QPushButton { padding:4px 8px; border-radius:10px; font-size:12px; }"
-            "QGroupBox { margin-top:10px; padding:5px; font-size:12px; }"
+            "QPushButton { background:#2563eb; color:white; border:none;"
+            " padding:4px 6px; border-radius:9px; font-size:12px; font-weight:800; }"
+            "QPushButton:hover { background:#3b82f6; }"
+            "QPushButton:pressed { background:#1d4ed8; }"
+            "QGroupBox { margin-top:9px; padding:3px; font-size:12px; }"
             "QGroupBox::title { subcontrol-origin:margin; subcontrol-position:top left;"
-            " left:12px; padding:0 5px; }"
-            "QCheckBox { font-size:12px; spacing:5px; }"
-            "QComboBox, QLineEdit, QSpinBox { padding:3px 6px; }"
+            " left:10px; padding:0 4px; }"
+            "QCheckBox { font-size:11px; spacing:4px; }"
+            "QComboBox, QLineEdit, QSpinBox { padding:2px 5px; }"
         )
         metric_grid = QGridLayout()
         metric_grid.setSpacing(5)
@@ -4192,9 +4195,20 @@ class MainWindow(QMainWindow):
         side_scroll.setWidget(side_widget)
         side_scroll.setFrameShape(QFrame.NoFrame)
         side_scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
-        side_scroll.setStyleSheet("QScrollArea { background:transparent; border:none; }")
-        # Enough width that the two metric cards and pills are never clipped.
-        side_scroll.setMinimumWidth(300)
+        # Transparent viewport + dark, thin scrollbar so no white shows through.
+        side_scroll.setStyleSheet(
+            "QScrollArea { background:transparent; border:none; }"
+            "QScrollBar:vertical { background:transparent; width:9px; margin:0; }"
+            "QScrollBar::handle:vertical { background:#334155; border-radius:4px; min-height:28px; }"
+            "QScrollBar::handle:vertical:hover { background:#475569; }"
+            "QScrollBar::add-line:vertical, QScrollBar::sub-line:vertical { height:0; }"
+            "QScrollBar::add-page:vertical, QScrollBar::sub-page:vertical { background:transparent; }"
+        )
+        side_scroll.viewport().setStyleSheet("background:transparent;")
+        # Keep the column narrow: the group titles are short, so it only needs
+        # room for the two-up button/card rows.
+        side_scroll.setMinimumWidth(248)
+        side_scroll.setMaximumWidth(340)
         self.preview_splitter.addWidget(left_widget)
         self.preview_splitter.addWidget(side_scroll)
         self.preview_splitter.setStretchFactor(0, 3)
