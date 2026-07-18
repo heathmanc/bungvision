@@ -45,7 +45,7 @@ from PySide6.QtWidgets import (
 
 from camera_backend import BaslerPylonCamera, create_camera_backend, list_basler_cameras
 
-APP_TITLE = "BungVision Python Line-Side HMI v0.9.105 Content-Fit Side Pane"
+APP_TITLE = "BungVision Python Line-Side HMI v0.9.106 Fixed Side Pane"
 ROOT = Path(__file__).resolve().parent
 LOG_DIR = ROOT / "logs"
 FAIL_DIR = ROOT / "fail_snapshots"
@@ -4286,36 +4286,13 @@ class MainWindow(QMainWindow):
         self.table.setAlternatingRowColors(True)
         self.table.hide()
         side.addStretch(1)
-        # Wrap the control column in a scroll area so that, on very small panels
-        # where even the condensed layout can't fully fit, every control stays
-        # reachable by scrolling instead of running off the bottom of the screen.
-        side_scroll = QScrollArea()
-        side_scroll.setWidgetResizable(True)
-        side_scroll.setWidget(side_widget)
-        side_scroll.setFrameShape(QFrame.NoFrame)
-        # As-needed (not off): the pane is sized to its content, so this bar
-        # should stay hidden, but it guarantees content is never permanently
-        # clipped if font metrics push the content past the width cap.
-        side_scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarAsNeeded)
-        # Transparent viewport + dark, thin scrollbar so no white shows through.
-        side_scroll.setStyleSheet(
-            "QScrollArea { background:transparent; border:none; }"
-            "QScrollBar:vertical { background:transparent; width:9px; margin:0; }"
-            "QScrollBar::handle:vertical { background:#334155; border-radius:4px; min-height:28px; }"
-            "QScrollBar::handle:vertical:hover { background:#475569; }"
-            "QScrollBar::add-line:vertical, QScrollBar::sub-line:vertical { height:0; }"
-            "QScrollBar::add-page:vertical, QScrollBar::sub-page:vertical { background:transparent; }"
-        )
-        side_scroll.viewport().setStyleSheet("background:transparent;")
-        # Right-anchored control column. Its width follows the actual content
-        # width (which depends on the target system's font metrics) plus room for
-        # the vertical scrollbar, so the right edge of the cards/buttons is never
-        # clipped. The camera pane absorbs all resize delta. See _size_side_pane().
-        self.side_scroll = side_scroll
+        # Fixed-width, right-anchored control column — no scroll areas. An
+        # industrial HMI has a static layout, so the pane width is locked once to
+        # fit the widest text that can ever appear (see _lock_side_pane_width())
+        # and never moves. The camera pane absorbs all resize delta.
         self._side_content = side_widget
-        side_scroll.setFixedWidth(300)
         self.preview_splitter.addWidget(left_widget)
-        self.preview_splitter.addWidget(side_scroll)
+        self.preview_splitter.addWidget(side_widget)
         self.preview_splitter.setStretchFactor(0, 1)
         self.preview_splitter.setStretchFactor(1, 0)
         # The side pane has a fixed width, so its splitter handle should not drag.
@@ -4323,6 +4300,7 @@ class MainWindow(QMainWindow):
         if handle is not None:
             handle.setEnabled(False)
         main.addWidget(self.preview_splitter, 1)
+        self._lock_side_pane_width()
 
         # Hidden backing log: keep log() calls and export/debug routines safe without
         # consuming operator-screen real estate.
@@ -4622,35 +4600,35 @@ class MainWindow(QMainWindow):
         else:
             cam.setMaximumWidth(max(cam.minimumWidth(), int(avail * frac)))
 
-    def _size_side_pane(self):
-        """Size the right control column to its actual content width.
+    def _lock_side_pane_width(self):
+        """Lock the control column to a fixed width sized for its worst case.
 
-        The needed width depends on the target system's font metrics and on
-        dynamic text (e.g. the 'Actual Camera WxH@fps' pill after a camera opens
-        or a model loads). Fixing a guessed width clipped the cards/buttons and
-        the clip never recovered. Instead, follow the content's own size hint,
-        add room for the vertical scrollbar, and clamp to a sane range.
+        The widest elements are the full-span Machine-Interface pills, whose
+        text is dynamic. Compute the pixel width of their worst-case strings via
+        the pill's own font metrics (deterministic and font-accurate on the
+        target system), add the pill/group/layout chrome, and lock the pane to
+        that. Because the width is fixed, runtime text can never move the pane.
         """
         sw = getattr(self, "_side_content", None)
-        sa = getattr(self, "side_scroll", None)
-        if sw is None or sa is None:
+        if sw is None:
             return
-        hint = int(sw.sizeHint().width())
-        sb = sa.verticalScrollBar()
-        sbw = int(sb.sizeHint().width()) if sb is not None else 12
-        if sbw <= 0:
-            sbw = 12
-        target = max(300, min(520, hint + sbw + 6))
-        if sa.width() != target or sa.minimumWidth() != target:
-            sa.setFixedWidth(target)
-
-    def showEvent(self, event):
-        super().showEvent(event)
-        self._size_side_pane()
+        # Worst-case full-span pill strings (camera detail line; PLC write error).
+        worst_texts = [
+            "Actual 2592x1944 @ 30  ROI 2592x1944+9999+9999",
+            "PLC Writes WRITE ERROR: TAG ERROR: reset_req...",
+        ]
+        pill = getattr(self, "plc_write_pill", None)
+        fm = pill.fontMetrics() if pill is not None else self.fontMetrics()
+        text_w = max(fm.horizontalAdvance(t) for t in worst_texts)
+        # Chrome around a full-span pill: pill padding (2*10) + border (2) +
+        # Machine-Interface group padding/border + side/group margins. Use a
+        # comfortable allowance so the text never touches the edges.
+        chrome = 56
+        width = max(300, text_w + chrome)
+        sw.setFixedWidth(width)
 
     def resizeEvent(self, event):
         super().resizeEvent(event)
-        self._size_side_pane()
         # Keep the preview scaled to the current camera-pane width.
         self._apply_preview_size(
             self.preview_size_combo.currentText() if hasattr(self, "preview_size_combo") else ""
@@ -6733,9 +6711,6 @@ class MainWindow(QMainWindow):
             self.update_plc_outputs(self.last_result)
             self.update_metrics(fps=self.fps)
             self.update_status_pills(self.last_result)
-            # Re-fit the control column in case dynamic text (camera/model pills)
-            # grew wider than the current pane width. No-op when unchanged.
-            self._size_side_pane()
 
     def update_decision(self, result: InspectionResult):
         if getattr(self, "reject_latched", False):
