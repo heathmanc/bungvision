@@ -45,7 +45,7 @@ from PySide6.QtWidgets import (
 
 from camera_backend import BaslerPylonCamera, create_camera_backend, list_basler_cameras
 
-APP_TITLE = "BungVision Python Line-Side HMI v0.9.101 XGA Fit"
+APP_TITLE = "BungVision Python Line-Side HMI v0.9.103 Display Settings Tab"
 ROOT = Path(__file__).resolve().parent
 LOG_DIR = ROOT / "logs"
 FAIL_DIR = ROOT / "fail_snapshots"
@@ -1942,12 +1942,12 @@ class MetricCard(QFrame):
         self.title = QLabel(title)
         self.value = QLabel(value)
         self.sub = QLabel(sub)
-        self.title.setStyleSheet("color:#94a3b8; font-size:11px; font-weight:800; letter-spacing:1px; background:transparent; border:none;")
-        self.value.setStyleSheet("color:white; font-size:21px; font-weight:900; background:transparent; border:none;")
-        self.sub.setStyleSheet("color:#64748b; font-size:12px; background:transparent; border:none;")
+        self.title.setStyleSheet("color:#94a3b8; font-size:10px; font-weight:800; letter-spacing:1px; background:transparent; border:none;")
+        self.value.setStyleSheet("color:white; font-size:18px; font-weight:900; background:transparent; border:none;")
+        self.sub.setStyleSheet("color:#64748b; font-size:11px; background:transparent; border:none;")
         layout = QVBoxLayout(self)
-        layout.setContentsMargins(12, 8, 12, 8)
-        layout.setSpacing(2)
+        layout.setContentsMargins(10, 4, 10, 4)
+        layout.setSpacing(1)
         layout.addWidget(self.title)
         layout.addWidget(self.value)
         layout.addWidget(self.sub)
@@ -3085,9 +3085,53 @@ class SettingsDialog(QDialog):
         pgrid.addWidget(test_stop_btn, row + 1, 2)
         pgrid.setRowStretch(row + 2, 1)
 
+        # ---- Display tab: camera overlay, image saving, reject classes ----
+        display_tab = QWidget()
+        dlay = QVBoxLayout(display_tab)
+        dlay.setContentsMargins(8, 8, 8, 8)
+        dlay.setSpacing(10)
+
+        overlay_group = QGroupBox("Camera Overlay")
+        ogrid = QGridLayout(overlay_group)
+        self.overlay_enable_local = QCheckBox("Overlay On")
+        self.overlay_boxes_local = QCheckBox("Detection Boxes")
+        self.overlay_labels_local = QCheckBox("Class Labels")
+        self.overlay_grades_local = QCheckBox("PASS/FAIL Badges")
+        self.overlay_fail_banner_local = QCheckBox("Fail Banner")
+        ogrid.addWidget(self.overlay_enable_local, 0, 0)
+        ogrid.addWidget(self.overlay_boxes_local, 0, 1)
+        ogrid.addWidget(self.overlay_labels_local, 1, 0)
+        ogrid.addWidget(self.overlay_grades_local, 1, 1)
+        ogrid.addWidget(self.overlay_fail_banner_local, 2, 0, 1, 2)
+        dlay.addWidget(overlay_group)
+
+        saving_group = QGroupBox("Image Saving (operator snapshots)")
+        sgrid = QGridLayout(saving_group)
+        self.save_pass_snap_local = QCheckBox("Save PASS Images")
+        self.save_fail_snap_local = QCheckBox("Save FAIL Images")
+        sgrid.addWidget(self.save_pass_snap_local, 0, 0)
+        sgrid.addWidget(self.save_fail_snap_local, 0, 1)
+        dlay.addWidget(saving_group)
+
+        reject_group = QGroupBox("Reject Classes")
+        rlay = QVBoxLayout(reject_group)
+        reject_desc = self._desc_label(
+            "Define YOLO class names that trigger an immediate PLC reject latch "
+            "(e.g. 'battery_down')."
+        )
+        edit_reject_btn = QPushButton("Edit Reject Classes…")
+        edit_reject_btn.clicked.connect(
+            lambda _checked=False: self.parent_hmi.open_reject_classes_dialog()
+        )
+        rlay.addWidget(reject_desc)
+        rlay.addWidget(edit_reject_btn)
+        dlay.addWidget(reject_group)
+        dlay.addStretch(1)
+
         tabs.addTab(self._scroll_tab(runtime), "Runtime")
         tabs.addTab(self._scroll_tab(inspect), "Inspection")
         tabs.addTab(self._scroll_tab(capture), "Capture")
+        tabs.addTab(self._scroll_tab(display_tab), "Display")
         tabs.addTab(self._scroll_tab(plc_tab), "PLC")
 
         buttons = QHBoxLayout()
@@ -3146,6 +3190,15 @@ class SettingsDialog(QDialog):
 
         self.save_pass_images_local.setChecked(bool(getattr(p, "save_pass_training_images", True)))
         self.save_fail_images_local.setChecked(bool(getattr(p, "save_fail_training_images", True)))
+
+        # Display tab: mirror the (now hidden) side-pane overlay / snapshot checkboxes.
+        self.overlay_enable_local.setChecked(p._checkbox_checked("overlay_enable_check", True))
+        self.overlay_boxes_local.setChecked(p._checkbox_checked("overlay_boxes_check", True))
+        self.overlay_labels_local.setChecked(p._checkbox_checked("overlay_labels_check", True))
+        self.overlay_grades_local.setChecked(p._checkbox_checked("overlay_grades_check", True))
+        self.overlay_fail_banner_local.setChecked(p._checkbox_checked("overlay_fail_banner_check", True))
+        self.save_pass_snap_local.setChecked(p._checkbox_checked("save_pass_images_check", True))
+        self.save_fail_snap_local.setChecked(p._checkbox_checked("save_fail_images_check", True))
         self.save_annotated_images_local.setChecked(bool(getattr(p, "save_training_annotated", True)))
         self.save_detection_json_local.setChecked(bool(getattr(p, "save_training_json", True)))
         self.save_yolo_txt_local.setChecked(bool(getattr(p, "save_training_yolo_txt", False)))
@@ -3216,6 +3269,22 @@ class SettingsDialog(QDialog):
 
         p.save_pass_training_images = self.save_pass_images_local.isChecked()
         p.save_fail_training_images = self.save_fail_images_local.isChecked()
+
+        # Display tab: push overlay / snapshot toggles back onto the hidden
+        # side-pane checkboxes so their existing change handlers run and apply.
+        for cb_name, local in (
+            ("overlay_enable_check", self.overlay_enable_local),
+            ("overlay_boxes_check", self.overlay_boxes_local),
+            ("overlay_labels_check", self.overlay_labels_local),
+            ("overlay_grades_check", self.overlay_grades_local),
+            ("overlay_fail_banner_check", self.overlay_fail_banner_local),
+            ("save_pass_images_check", self.save_pass_snap_local),
+            ("save_fail_images_check", self.save_fail_snap_local),
+        ):
+            cb = getattr(p, cb_name, None)
+            if cb is not None:
+                cb.setChecked(local.isChecked())
+
         p.save_training_annotated = self.save_annotated_images_local.isChecked()
         p.save_training_json = self.save_detection_json_local.isChecked()
         p.save_training_yolo_txt = self.save_yolo_txt_local.isChecked()
@@ -3975,7 +4044,24 @@ class MainWindow(QMainWindow):
         left.addWidget(self.camera_widget, 1)
 
         side = QVBoxLayout(side_widget)
+        # Condensed spacing so the whole control column fits the vertical budget
+        # of small operator panels (e.g. XGA 1024x768). A stylesheet scoped to the
+        # side column overrides the roomier main-window button/group padding.
+        side.setContentsMargins(0, 0, 0, 0)
+        side.setSpacing(5)
+        side_widget.setStyleSheet(
+            "QPushButton { background:#2563eb; color:white; border:none;"
+            " padding:4px 6px; border-radius:9px; font-size:12px; font-weight:800; }"
+            "QPushButton:hover { background:#3b82f6; }"
+            "QPushButton:pressed { background:#1d4ed8; }"
+            "QGroupBox { margin-top:9px; padding:3px; font-size:12px; }"
+            "QGroupBox::title { subcontrol-origin:margin; subcontrol-position:top left;"
+            " left:10px; padding:0 4px; }"
+            "QCheckBox { font-size:11px; spacing:4px; }"
+            "QComboBox, QLineEdit, QSpinBox { padding:2px 5px; }"
+        )
         metric_grid = QGridLayout()
+        metric_grid.setSpacing(5)
         self.pass_rate_card = MetricCard("PASS RATE", "--", "no inspections", "neutral")
         self.reject_card = MetricCard("REJECTS", "0", "current session", "fail")
         self.infer_card = MetricCard("INFERENCE", "-- FPS", "-- ms", "info")
@@ -4031,6 +4117,8 @@ class MainWindow(QMainWindow):
 
         controls = QGroupBox("Operator Controls")
         cg = QGridLayout(controls)
+        cg.setContentsMargins(6, 6, 6, 6)
+        cg.setSpacing(4)
 
         # Demo controls still exist internally for development, but are hidden from the operator screen.
         self.demo_check = QCheckBox("Demo Mode")
@@ -4093,13 +4181,21 @@ class MainWindow(QMainWindow):
         cg.addWidget(self.reset_reject_btn, 2, 0)
         cg.addWidget(self.reset_btn, 2, 1)
         cg.addWidget(self.summary_btn, 3, 0, 1, 2)
-        cg.addWidget(self.reject_classes_btn, 4, 0, 1, 2)
-        cg.addWidget(self.bypass_check, 5, 0, 1, 2)
-        cg.addWidget(preview_size_label, 6, 0)
-        cg.addWidget(self.preview_size_combo, 6, 1)
+        # Reject Classes now lives in the Settings dialog (Display tab); the button
+        # object is kept for internal references but is not shown on the operator screen.
+        self.reject_classes_btn.hide()
+        cg.addWidget(self.bypass_check, 4, 0, 1, 2)
+        cg.addWidget(preview_size_label, 5, 0)
+        cg.addWidget(self.preview_size_combo, 5, 1)
         side.addWidget(controls)
 
+        # Camera Overlay and Image Saving controls have moved to the Settings
+        # dialog (Display tab). The checkboxes are still created here as the
+        # authoritative state holders that the runtime reads; the group boxes are
+        # retained (self.*) so the checkboxes persist, but are not shown on the
+        # operator screen.
         overlay_box = QGroupBox("Camera Overlay")
+        self.overlay_box = overlay_box
         og = QGridLayout(overlay_box)
         og.setContentsMargins(6, 8, 6, 6)
         og.setSpacing(2)
@@ -4126,9 +4222,10 @@ class MainWindow(QMainWindow):
         og.addWidget(self.overlay_labels_check, 1, 0)
         og.addWidget(self.overlay_grades_check, 1, 1)
         og.addWidget(self.overlay_fail_banner_check, 2, 0, 1, 2)
-        side.addWidget(overlay_box)
+        overlay_box.hide()
 
         saving_box = QGroupBox("Image Saving")
+        self.saving_box = saving_box
         sg = QGridLayout(saving_box)
         sg.setContentsMargins(6, 8, 6, 6)
         sg.setSpacing(4)
@@ -4140,10 +4237,12 @@ class MainWindow(QMainWindow):
         self.save_fail_images_check.stateChanged.connect(lambda _state=None: self.on_image_saving_changed())
         sg.addWidget(self.save_pass_images_check, 0, 0)
         sg.addWidget(self.save_fail_images_check, 0, 1)
-        side.addWidget(saving_box)
+        saving_box.hide()
 
         plc = QGroupBox("Machine Interface")
         pg = QGridLayout(plc)
+        pg.setContentsMargins(6, 8, 6, 6)
+        pg.setSpacing(4)
         self.heartbeat_pill = Pill("Heartbeat SIM", "warn")
         self.stop_output_pill = Pill("Stop Output OFF", "neutral")
         self.alarm_pill = Pill("Alarm OFF", "neutral")
@@ -4166,8 +4265,30 @@ class MainWindow(QMainWindow):
         self.table.setAlternatingRowColors(True)
         self.table.hide()
         side.addStretch(1)
+        # Wrap the control column in a scroll area so that, on very small panels
+        # where even the condensed layout can't fully fit, every control stays
+        # reachable by scrolling instead of running off the bottom of the screen.
+        side_scroll = QScrollArea()
+        side_scroll.setWidgetResizable(True)
+        side_scroll.setWidget(side_widget)
+        side_scroll.setFrameShape(QFrame.NoFrame)
+        side_scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
+        # Transparent viewport + dark, thin scrollbar so no white shows through.
+        side_scroll.setStyleSheet(
+            "QScrollArea { background:transparent; border:none; }"
+            "QScrollBar:vertical { background:transparent; width:9px; margin:0; }"
+            "QScrollBar::handle:vertical { background:#334155; border-radius:4px; min-height:28px; }"
+            "QScrollBar::handle:vertical:hover { background:#475569; }"
+            "QScrollBar::add-line:vertical, QScrollBar::sub-line:vertical { height:0; }"
+            "QScrollBar::add-page:vertical, QScrollBar::sub-page:vertical { background:transparent; }"
+        )
+        side_scroll.viewport().setStyleSheet("background:transparent;")
+        # Keep the column narrow: the group titles are short, so it only needs
+        # room for the two-up button/card rows.
+        side_scroll.setMinimumWidth(248)
+        side_scroll.setMaximumWidth(340)
         self.preview_splitter.addWidget(left_widget)
-        self.preview_splitter.addWidget(side_widget)
+        self.preview_splitter.addWidget(side_scroll)
         self.preview_splitter.setStretchFactor(0, 3)
         self.preview_splitter.setStretchFactor(1, 1)
         main.addWidget(self.preview_splitter, 1)
