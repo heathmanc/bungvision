@@ -45,7 +45,7 @@ from PySide6.QtWidgets import (
 
 from camera_backend import BaslerPylonCamera, create_camera_backend, list_basler_cameras
 
-APP_TITLE = "BungVision Python Line-Side HMI v0.9.104 Anchored Pane + Tooltips"
+APP_TITLE = "BungVision Python Line-Side HMI v0.9.105 Content-Fit Side Pane"
 ROOT = Path(__file__).resolve().parent
 LOG_DIR = ROOT / "logs"
 FAIL_DIR = ROOT / "fail_snapshots"
@@ -4293,7 +4293,10 @@ class MainWindow(QMainWindow):
         side_scroll.setWidgetResizable(True)
         side_scroll.setWidget(side_widget)
         side_scroll.setFrameShape(QFrame.NoFrame)
-        side_scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
+        # As-needed (not off): the pane is sized to its content, so this bar
+        # should stay hidden, but it guarantees content is never permanently
+        # clipped if font metrics push the content past the width cap.
+        side_scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarAsNeeded)
         # Transparent viewport + dark, thin scrollbar so no white shows through.
         side_scroll.setStyleSheet(
             "QScrollArea { background:transparent; border:none; }"
@@ -4304,10 +4307,12 @@ class MainWindow(QMainWindow):
             "QScrollBar::add-page:vertical, QScrollBar::sub-page:vertical { background:transparent; }"
         )
         side_scroll.viewport().setStyleSheet("background:transparent;")
-        # Fixed-width, right-anchored control column: the camera pane absorbs all
-        # resize delta so the side pane is never pushed off-screen or left with a
-        # gap. Width fits the two-up button/card rows plus the scrollbar.
+        # Right-anchored control column. Its width follows the actual content
+        # width (which depends on the target system's font metrics) plus room for
+        # the vertical scrollbar, so the right edge of the cards/buttons is never
+        # clipped. The camera pane absorbs all resize delta. See _size_side_pane().
         self.side_scroll = side_scroll
+        self._side_content = side_widget
         side_scroll.setFixedWidth(300)
         self.preview_splitter.addWidget(left_widget)
         self.preview_splitter.addWidget(side_scroll)
@@ -4617,8 +4622,35 @@ class MainWindow(QMainWindow):
         else:
             cam.setMaximumWidth(max(cam.minimumWidth(), int(avail * frac)))
 
+    def _size_side_pane(self):
+        """Size the right control column to its actual content width.
+
+        The needed width depends on the target system's font metrics and on
+        dynamic text (e.g. the 'Actual Camera WxH@fps' pill after a camera opens
+        or a model loads). Fixing a guessed width clipped the cards/buttons and
+        the clip never recovered. Instead, follow the content's own size hint,
+        add room for the vertical scrollbar, and clamp to a sane range.
+        """
+        sw = getattr(self, "_side_content", None)
+        sa = getattr(self, "side_scroll", None)
+        if sw is None or sa is None:
+            return
+        hint = int(sw.sizeHint().width())
+        sb = sa.verticalScrollBar()
+        sbw = int(sb.sizeHint().width()) if sb is not None else 12
+        if sbw <= 0:
+            sbw = 12
+        target = max(300, min(520, hint + sbw + 6))
+        if sa.width() != target or sa.minimumWidth() != target:
+            sa.setFixedWidth(target)
+
+    def showEvent(self, event):
+        super().showEvent(event)
+        self._size_side_pane()
+
     def resizeEvent(self, event):
         super().resizeEvent(event)
+        self._size_side_pane()
         # Keep the preview scaled to the current camera-pane width.
         self._apply_preview_size(
             self.preview_size_combo.currentText() if hasattr(self, "preview_size_combo") else ""
@@ -6701,6 +6733,9 @@ class MainWindow(QMainWindow):
             self.update_plc_outputs(self.last_result)
             self.update_metrics(fps=self.fps)
             self.update_status_pills(self.last_result)
+            # Re-fit the control column in case dynamic text (camera/model pills)
+            # grew wider than the current pane width. No-op when unchanged.
+            self._size_side_pane()
 
     def update_decision(self, result: InspectionResult):
         if getattr(self, "reject_latched", False):
