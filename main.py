@@ -45,7 +45,7 @@ from PySide6.QtWidgets import (
 
 from camera_backend import BaslerPylonCamera, create_camera_backend, list_basler_cameras
 
-APP_TITLE = "BungVision Python Line-Side HMI v0.9.101 XGA Fit"
+APP_TITLE = "BungVision Python Line-Side HMI v0.9.102 Condensed Side Pane"
 ROOT = Path(__file__).resolve().parent
 LOG_DIR = ROOT / "logs"
 FAIL_DIR = ROOT / "fail_snapshots"
@@ -1942,12 +1942,12 @@ class MetricCard(QFrame):
         self.title = QLabel(title)
         self.value = QLabel(value)
         self.sub = QLabel(sub)
-        self.title.setStyleSheet("color:#94a3b8; font-size:11px; font-weight:800; letter-spacing:1px; background:transparent; border:none;")
-        self.value.setStyleSheet("color:white; font-size:21px; font-weight:900; background:transparent; border:none;")
-        self.sub.setStyleSheet("color:#64748b; font-size:12px; background:transparent; border:none;")
+        self.title.setStyleSheet("color:#94a3b8; font-size:10px; font-weight:800; letter-spacing:1px; background:transparent; border:none;")
+        self.value.setStyleSheet("color:white; font-size:18px; font-weight:900; background:transparent; border:none;")
+        self.sub.setStyleSheet("color:#64748b; font-size:11px; background:transparent; border:none;")
         layout = QVBoxLayout(self)
-        layout.setContentsMargins(12, 8, 12, 8)
-        layout.setSpacing(2)
+        layout.setContentsMargins(10, 4, 10, 4)
+        layout.setSpacing(1)
         layout.addWidget(self.title)
         layout.addWidget(self.value)
         layout.addWidget(self.sub)
@@ -3975,7 +3975,21 @@ class MainWindow(QMainWindow):
         left.addWidget(self.camera_widget, 1)
 
         side = QVBoxLayout(side_widget)
+        # Condensed spacing so the whole control column fits the vertical budget
+        # of small operator panels (e.g. XGA 1024x768). A stylesheet scoped to the
+        # side column overrides the roomier main-window button/group padding.
+        side.setContentsMargins(0, 0, 0, 0)
+        side.setSpacing(5)
+        side_widget.setStyleSheet(
+            "QPushButton { padding:4px 8px; border-radius:10px; font-size:12px; }"
+            "QGroupBox { margin-top:10px; padding:5px; font-size:12px; }"
+            "QGroupBox::title { subcontrol-origin:margin; subcontrol-position:top left;"
+            " left:12px; padding:0 5px; }"
+            "QCheckBox { font-size:12px; spacing:5px; }"
+            "QComboBox, QLineEdit, QSpinBox { padding:3px 6px; }"
+        )
         metric_grid = QGridLayout()
+        metric_grid.setSpacing(5)
         self.pass_rate_card = MetricCard("PASS RATE", "--", "no inspections", "neutral")
         self.reject_card = MetricCard("REJECTS", "0", "current session", "fail")
         self.infer_card = MetricCard("INFERENCE", "-- FPS", "-- ms", "info")
@@ -4031,6 +4045,8 @@ class MainWindow(QMainWindow):
 
         controls = QGroupBox("Operator Controls")
         cg = QGridLayout(controls)
+        cg.setContentsMargins(6, 6, 6, 6)
+        cg.setSpacing(4)
 
         # Demo controls still exist internally for development, but are hidden from the operator screen.
         self.demo_check = QCheckBox("Demo Mode")
@@ -4144,6 +4160,8 @@ class MainWindow(QMainWindow):
 
         plc = QGroupBox("Machine Interface")
         pg = QGridLayout(plc)
+        pg.setContentsMargins(6, 8, 6, 6)
+        pg.setSpacing(4)
         self.heartbeat_pill = Pill("Heartbeat SIM", "warn")
         self.stop_output_pill = Pill("Stop Output OFF", "neutral")
         self.alarm_pill = Pill("Alarm OFF", "neutral")
@@ -4166,8 +4184,19 @@ class MainWindow(QMainWindow):
         self.table.setAlternatingRowColors(True)
         self.table.hide()
         side.addStretch(1)
+        # Wrap the control column in a scroll area so that, on very small panels
+        # where even the condensed layout can't fully fit, every control stays
+        # reachable by scrolling instead of running off the bottom of the screen.
+        side_scroll = QScrollArea()
+        side_scroll.setWidgetResizable(True)
+        side_scroll.setWidget(side_widget)
+        side_scroll.setFrameShape(QFrame.NoFrame)
+        side_scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
+        side_scroll.setStyleSheet("QScrollArea { background:transparent; border:none; }")
+        # Enough width that the two metric cards and pills are never clipped.
+        side_scroll.setMinimumWidth(300)
         self.preview_splitter.addWidget(left_widget)
-        self.preview_splitter.addWidget(side_widget)
+        self.preview_splitter.addWidget(side_scroll)
         self.preview_splitter.setStretchFactor(0, 3)
         self.preview_splitter.setStretchFactor(1, 1)
         main.addWidget(self.preview_splitter, 1)
