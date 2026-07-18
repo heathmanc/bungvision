@@ -45,7 +45,7 @@ from PySide6.QtWidgets import (
 
 from camera_backend import BaslerPylonCamera, create_camera_backend, list_basler_cameras
 
-APP_TITLE = "BungVision Python Line-Side HMI v0.9.103 Display Settings Tab"
+APP_TITLE = "BungVision Python Line-Side HMI v0.9.104 Anchored Pane + Tooltips"
 ROOT = Path(__file__).resolve().parent
 LOG_DIR = ROOT / "logs"
 FAIL_DIR = ROOT / "fail_snapshots"
@@ -188,8 +188,25 @@ def readable_popup_qss() -> str:
     """
 
 
+def tooltip_qss() -> str:
+    """Readable tooltips. Without this, tooltips render as dark/black boxes on
+    the app's dark theme."""
+    return """
+        QToolTip {
+            background:#1e293b;
+            color:#f8fafc;
+            border:1px solid #475569;
+            border-radius:6px;
+            padding:4px 8px;
+            font-size:12px;
+            font-weight:600;
+            opacity:255;
+        }
+    """
+
+
 def common_readability_qss() -> str:
-    return high_contrast_checkbox_qss() + readable_popup_qss()
+    return high_contrast_checkbox_qss() + readable_popup_qss() + tooltip_qss()
 
 
 def apply_global_readability_style() -> None:
@@ -4042,6 +4059,10 @@ class MainWindow(QMainWindow):
         self.camera_widget = CameraWidget()
         self.camera_widget.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Expanding)
         left.addWidget(self.camera_widget, 1)
+        # Center the preview horizontally so a reduced Preview Size sits centered
+        # in the camera pane rather than clinging to one edge.
+        left.setAlignment(self.camera_widget, Qt.AlignHCenter)
+        self._camera_pane = left_widget
 
         side = QVBoxLayout(side_widget)
         # Condensed spacing so the whole control column fits the vertical budget
@@ -4283,14 +4304,19 @@ class MainWindow(QMainWindow):
             "QScrollBar::add-page:vertical, QScrollBar::sub-page:vertical { background:transparent; }"
         )
         side_scroll.viewport().setStyleSheet("background:transparent;")
-        # Keep the column narrow: the group titles are short, so it only needs
-        # room for the two-up button/card rows.
-        side_scroll.setMinimumWidth(248)
-        side_scroll.setMaximumWidth(340)
+        # Fixed-width, right-anchored control column: the camera pane absorbs all
+        # resize delta so the side pane is never pushed off-screen or left with a
+        # gap. Width fits the two-up button/card rows plus the scrollbar.
+        self.side_scroll = side_scroll
+        side_scroll.setFixedWidth(300)
         self.preview_splitter.addWidget(left_widget)
         self.preview_splitter.addWidget(side_scroll)
-        self.preview_splitter.setStretchFactor(0, 3)
-        self.preview_splitter.setStretchFactor(1, 1)
+        self.preview_splitter.setStretchFactor(0, 1)
+        self.preview_splitter.setStretchFactor(1, 0)
+        # The side pane has a fixed width, so its splitter handle should not drag.
+        handle = self.preview_splitter.handle(1)
+        if handle is not None:
+            handle.setEnabled(False)
         main.addWidget(self.preview_splitter, 1)
 
         # Hidden backing log: keep log() calls and export/debug routines safe without
@@ -4566,19 +4592,37 @@ class MainWindow(QMainWindow):
             return default
 
     def _apply_preview_size(self, text: str = ""):
-        """Adjust the camera/side splitter ratio based on the preview size selection."""
-        if not hasattr(self, "preview_splitter"):
+        """Scale the camera preview within its (flexible) pane.
+
+        The side control column is a fixed-width, right-anchored panel, so the
+        preview size no longer changes the split ratio (which used to leave the
+        side pane un-anchored or push it off-screen). Instead it caps the camera
+        widget's width as a fraction of the available camera pane.
+        """
+        cam = getattr(self, "camera_widget", None)
+        pane = getattr(self, "_camera_pane", None)
+        if cam is None or pane is None:
             return
+        if not text:
+            text = self.preview_size_combo.currentText() if hasattr(self, "preview_size_combo") else "3/4"
         fracs = {"full": 1.0, "3/4": 0.75, "1/2": 0.50, "1/4": 0.25}
         frac = fracs.get(text.strip().lower(), 0.75)
-        total = self.preview_splitter.width()
-        if total < 100:
+        avail = pane.width()
+        if avail < 100:
             # Widget not yet shown — defer until it's visible.
             QTimer.singleShot(50, lambda: self._apply_preview_size(text))
             return
-        cam_w = max(100, int(total * frac))
-        side_w = max(0, total - cam_w)
-        self.preview_splitter.setSizes([cam_w, side_w])
+        if frac >= 1.0:
+            cam.setMaximumWidth(16777215)
+        else:
+            cam.setMaximumWidth(max(cam.minimumWidth(), int(avail * frac)))
+
+    def resizeEvent(self, event):
+        super().resizeEvent(event)
+        # Keep the preview scaled to the current camera-pane width.
+        self._apply_preview_size(
+            self.preview_size_combo.currentText() if hasattr(self, "preview_size_combo") else ""
+        )
 
     def _matched_preview_rgb(self, display_seq: int) -> Optional[np.ndarray]:
         """Return the off-thread-scaled preview only if it matches the display frame.
