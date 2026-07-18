@@ -45,7 +45,7 @@ from PySide6.QtWidgets import (
 
 from camera_backend import BaslerPylonCamera, create_camera_backend, list_basler_cameras
 
-APP_TITLE = "BungVision Python Line-Side HMI v0.9.100 PLC Reset Input"
+APP_TITLE = "BungVision Python Line-Side HMI v0.9.101 XGA Fit"
 ROOT = Path(__file__).resolve().parent
 LOG_DIR = ROOT / "logs"
 FAIL_DIR = ROOT / "fail_snapshots"
@@ -1473,7 +1473,9 @@ def build_preview_rgb(frame_bgr: np.ndarray, max_w: int, max_h: int) -> Optional
 class CameraWidget(QWidget):
     def __init__(self):
         super().__init__()
-        self.setMinimumSize(680, 300)
+        # Keep this small enough that the whole HMI can fit on a 1024x768 (XGA)
+        # operator panel alongside the side control column.
+        self.setMinimumSize(420, 260)
         self.frame_bgr: Optional[np.ndarray] = None
         self.result: Optional[InspectionResult] = None
         self.overlay_enabled = True
@@ -3700,7 +3702,21 @@ class MainWindow(QMainWindow):
         super().__init__()
         self.setWindowTitle(APP_TITLE)
         self.setWindowFlags(Qt.Window)
-        self.resize(1280, 720)
+        # Desired size on a roomy desktop; clamped to the actual screen below so
+        # the window never opens wider/taller than the display (e.g. XGA 1024x768).
+        default_w, default_h = 1280, 720
+        try:
+            screen = QApplication.primaryScreen()
+            avail = screen.availableGeometry() if screen is not None else None
+        except Exception:
+            avail = None
+        if avail is not None and avail.width() > 0 and avail.height() > 0:
+            self.resize(min(default_w, avail.width()), min(default_h, avail.height()))
+            # Remember whether this is a small panel so main() can maximize it.
+            self._small_screen = avail.width() <= 1280 or avail.height() <= 800
+        else:
+            self.resize(default_w, default_h)
+            self._small_screen = False
         self.cap: Optional[Any] = None
         self.camera_backend = "opencv"
         self.opencv_api = "auto"
@@ -7186,7 +7202,12 @@ def main():
     sys.argv = _argv_string_list(sys.argv)
     _write_debug_log(f"main() post-QApplication argv={sys.argv!r}")
     w = MainWindow()
-    w.show()
+    # On small operator panels (e.g. XGA 1024x768) maximize so the entire HMI
+    # is reachable within the screen instead of opening partly off-screen.
+    if bool(getattr(w, "_small_screen", False)):
+        w.showMaximized()
+    else:
+        w.show()
     sys.exit(app.exec())
 
 if __name__ == "__main__":
