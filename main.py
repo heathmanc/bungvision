@@ -45,7 +45,7 @@ from PySide6.QtWidgets import (
 
 from camera_backend import BaslerPylonCamera, create_camera_backend, list_basler_cameras
 
-APP_TITLE = "BungVision Python Line-Side HMI v0.9.104 Anchored Pane + Tooltips"
+APP_TITLE = "BungVision Python Line-Side HMI v0.9.106 Fixed Side Pane"
 ROOT = Path(__file__).resolve().parent
 LOG_DIR = ROOT / "logs"
 FAIL_DIR = ROOT / "fail_snapshots"
@@ -4286,31 +4286,13 @@ class MainWindow(QMainWindow):
         self.table.setAlternatingRowColors(True)
         self.table.hide()
         side.addStretch(1)
-        # Wrap the control column in a scroll area so that, on very small panels
-        # where even the condensed layout can't fully fit, every control stays
-        # reachable by scrolling instead of running off the bottom of the screen.
-        side_scroll = QScrollArea()
-        side_scroll.setWidgetResizable(True)
-        side_scroll.setWidget(side_widget)
-        side_scroll.setFrameShape(QFrame.NoFrame)
-        side_scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
-        # Transparent viewport + dark, thin scrollbar so no white shows through.
-        side_scroll.setStyleSheet(
-            "QScrollArea { background:transparent; border:none; }"
-            "QScrollBar:vertical { background:transparent; width:9px; margin:0; }"
-            "QScrollBar::handle:vertical { background:#334155; border-radius:4px; min-height:28px; }"
-            "QScrollBar::handle:vertical:hover { background:#475569; }"
-            "QScrollBar::add-line:vertical, QScrollBar::sub-line:vertical { height:0; }"
-            "QScrollBar::add-page:vertical, QScrollBar::sub-page:vertical { background:transparent; }"
-        )
-        side_scroll.viewport().setStyleSheet("background:transparent;")
-        # Fixed-width, right-anchored control column: the camera pane absorbs all
-        # resize delta so the side pane is never pushed off-screen or left with a
-        # gap. Width fits the two-up button/card rows plus the scrollbar.
-        self.side_scroll = side_scroll
-        side_scroll.setFixedWidth(300)
+        # Fixed-width, right-anchored control column — no scroll areas. An
+        # industrial HMI has a static layout, so the pane width is locked once to
+        # fit the widest text that can ever appear (see _lock_side_pane_width())
+        # and never moves. The camera pane absorbs all resize delta.
+        self._side_content = side_widget
         self.preview_splitter.addWidget(left_widget)
-        self.preview_splitter.addWidget(side_scroll)
+        self.preview_splitter.addWidget(side_widget)
         self.preview_splitter.setStretchFactor(0, 1)
         self.preview_splitter.setStretchFactor(1, 0)
         # The side pane has a fixed width, so its splitter handle should not drag.
@@ -4318,6 +4300,7 @@ class MainWindow(QMainWindow):
         if handle is not None:
             handle.setEnabled(False)
         main.addWidget(self.preview_splitter, 1)
+        self._lock_side_pane_width()
 
         # Hidden backing log: keep log() calls and export/debug routines safe without
         # consuming operator-screen real estate.
@@ -4616,6 +4599,33 @@ class MainWindow(QMainWindow):
             cam.setMaximumWidth(16777215)
         else:
             cam.setMaximumWidth(max(cam.minimumWidth(), int(avail * frac)))
+
+    def _lock_side_pane_width(self):
+        """Lock the control column to a fixed width sized for its worst case.
+
+        The widest elements are the full-span Machine-Interface pills, whose
+        text is dynamic. Compute the pixel width of their worst-case strings via
+        the pill's own font metrics (deterministic and font-accurate on the
+        target system), add the pill/group/layout chrome, and lock the pane to
+        that. Because the width is fixed, runtime text can never move the pane.
+        """
+        sw = getattr(self, "_side_content", None)
+        if sw is None:
+            return
+        # Worst-case full-span pill strings (camera detail line; PLC write error).
+        worst_texts = [
+            "Actual 2592x1944 @ 30  ROI 2592x1944+9999+9999",
+            "PLC Writes WRITE ERROR: TAG ERROR: reset_req...",
+        ]
+        pill = getattr(self, "plc_write_pill", None)
+        fm = pill.fontMetrics() if pill is not None else self.fontMetrics()
+        text_w = max(fm.horizontalAdvance(t) for t in worst_texts)
+        # Chrome around a full-span pill: pill padding (2*10) + border (2) +
+        # Machine-Interface group padding/border + side/group margins. Use a
+        # comfortable allowance so the text never touches the edges.
+        chrome = 56
+        width = max(300, text_w + chrome)
+        sw.setFixedWidth(width)
 
     def resizeEvent(self, event):
         super().resizeEvent(event)
