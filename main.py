@@ -45,7 +45,7 @@ from PySide6.QtWidgets import (
 
 from camera_backend import BaslerPylonCamera, create_camera_backend, list_basler_cameras
 
-APP_TITLE = "BungVision Python Line-Side HMI v0.9.102 Condensed Side Pane"
+APP_TITLE = "BungVision Python Line-Side HMI v0.9.103 Display Settings Tab"
 ROOT = Path(__file__).resolve().parent
 LOG_DIR = ROOT / "logs"
 FAIL_DIR = ROOT / "fail_snapshots"
@@ -3085,9 +3085,53 @@ class SettingsDialog(QDialog):
         pgrid.addWidget(test_stop_btn, row + 1, 2)
         pgrid.setRowStretch(row + 2, 1)
 
+        # ---- Display tab: camera overlay, image saving, reject classes ----
+        display_tab = QWidget()
+        dlay = QVBoxLayout(display_tab)
+        dlay.setContentsMargins(8, 8, 8, 8)
+        dlay.setSpacing(10)
+
+        overlay_group = QGroupBox("Camera Overlay")
+        ogrid = QGridLayout(overlay_group)
+        self.overlay_enable_local = QCheckBox("Overlay On")
+        self.overlay_boxes_local = QCheckBox("Detection Boxes")
+        self.overlay_labels_local = QCheckBox("Class Labels")
+        self.overlay_grades_local = QCheckBox("PASS/FAIL Badges")
+        self.overlay_fail_banner_local = QCheckBox("Fail Banner")
+        ogrid.addWidget(self.overlay_enable_local, 0, 0)
+        ogrid.addWidget(self.overlay_boxes_local, 0, 1)
+        ogrid.addWidget(self.overlay_labels_local, 1, 0)
+        ogrid.addWidget(self.overlay_grades_local, 1, 1)
+        ogrid.addWidget(self.overlay_fail_banner_local, 2, 0, 1, 2)
+        dlay.addWidget(overlay_group)
+
+        saving_group = QGroupBox("Image Saving (operator snapshots)")
+        sgrid = QGridLayout(saving_group)
+        self.save_pass_snap_local = QCheckBox("Save PASS Images")
+        self.save_fail_snap_local = QCheckBox("Save FAIL Images")
+        sgrid.addWidget(self.save_pass_snap_local, 0, 0)
+        sgrid.addWidget(self.save_fail_snap_local, 0, 1)
+        dlay.addWidget(saving_group)
+
+        reject_group = QGroupBox("Reject Classes")
+        rlay = QVBoxLayout(reject_group)
+        reject_desc = self._desc_label(
+            "Define YOLO class names that trigger an immediate PLC reject latch "
+            "(e.g. 'battery_down')."
+        )
+        edit_reject_btn = QPushButton("Edit Reject Classes…")
+        edit_reject_btn.clicked.connect(
+            lambda _checked=False: self.parent_hmi.open_reject_classes_dialog()
+        )
+        rlay.addWidget(reject_desc)
+        rlay.addWidget(edit_reject_btn)
+        dlay.addWidget(reject_group)
+        dlay.addStretch(1)
+
         tabs.addTab(self._scroll_tab(runtime), "Runtime")
         tabs.addTab(self._scroll_tab(inspect), "Inspection")
         tabs.addTab(self._scroll_tab(capture), "Capture")
+        tabs.addTab(self._scroll_tab(display_tab), "Display")
         tabs.addTab(self._scroll_tab(plc_tab), "PLC")
 
         buttons = QHBoxLayout()
@@ -3146,6 +3190,15 @@ class SettingsDialog(QDialog):
 
         self.save_pass_images_local.setChecked(bool(getattr(p, "save_pass_training_images", True)))
         self.save_fail_images_local.setChecked(bool(getattr(p, "save_fail_training_images", True)))
+
+        # Display tab: mirror the (now hidden) side-pane overlay / snapshot checkboxes.
+        self.overlay_enable_local.setChecked(p._checkbox_checked("overlay_enable_check", True))
+        self.overlay_boxes_local.setChecked(p._checkbox_checked("overlay_boxes_check", True))
+        self.overlay_labels_local.setChecked(p._checkbox_checked("overlay_labels_check", True))
+        self.overlay_grades_local.setChecked(p._checkbox_checked("overlay_grades_check", True))
+        self.overlay_fail_banner_local.setChecked(p._checkbox_checked("overlay_fail_banner_check", True))
+        self.save_pass_snap_local.setChecked(p._checkbox_checked("save_pass_images_check", True))
+        self.save_fail_snap_local.setChecked(p._checkbox_checked("save_fail_images_check", True))
         self.save_annotated_images_local.setChecked(bool(getattr(p, "save_training_annotated", True)))
         self.save_detection_json_local.setChecked(bool(getattr(p, "save_training_json", True)))
         self.save_yolo_txt_local.setChecked(bool(getattr(p, "save_training_yolo_txt", False)))
@@ -3216,6 +3269,22 @@ class SettingsDialog(QDialog):
 
         p.save_pass_training_images = self.save_pass_images_local.isChecked()
         p.save_fail_training_images = self.save_fail_images_local.isChecked()
+
+        # Display tab: push overlay / snapshot toggles back onto the hidden
+        # side-pane checkboxes so their existing change handlers run and apply.
+        for cb_name, local in (
+            ("overlay_enable_check", self.overlay_enable_local),
+            ("overlay_boxes_check", self.overlay_boxes_local),
+            ("overlay_labels_check", self.overlay_labels_local),
+            ("overlay_grades_check", self.overlay_grades_local),
+            ("overlay_fail_banner_check", self.overlay_fail_banner_local),
+            ("save_pass_images_check", self.save_pass_snap_local),
+            ("save_fail_images_check", self.save_fail_snap_local),
+        ):
+            cb = getattr(p, cb_name, None)
+            if cb is not None:
+                cb.setChecked(local.isChecked())
+
         p.save_training_annotated = self.save_annotated_images_local.isChecked()
         p.save_training_json = self.save_detection_json_local.isChecked()
         p.save_training_yolo_txt = self.save_yolo_txt_local.isChecked()
@@ -4112,13 +4181,21 @@ class MainWindow(QMainWindow):
         cg.addWidget(self.reset_reject_btn, 2, 0)
         cg.addWidget(self.reset_btn, 2, 1)
         cg.addWidget(self.summary_btn, 3, 0, 1, 2)
-        cg.addWidget(self.reject_classes_btn, 4, 0, 1, 2)
-        cg.addWidget(self.bypass_check, 5, 0, 1, 2)
-        cg.addWidget(preview_size_label, 6, 0)
-        cg.addWidget(self.preview_size_combo, 6, 1)
+        # Reject Classes now lives in the Settings dialog (Display tab); the button
+        # object is kept for internal references but is not shown on the operator screen.
+        self.reject_classes_btn.hide()
+        cg.addWidget(self.bypass_check, 4, 0, 1, 2)
+        cg.addWidget(preview_size_label, 5, 0)
+        cg.addWidget(self.preview_size_combo, 5, 1)
         side.addWidget(controls)
 
+        # Camera Overlay and Image Saving controls have moved to the Settings
+        # dialog (Display tab). The checkboxes are still created here as the
+        # authoritative state holders that the runtime reads; the group boxes are
+        # retained (self.*) so the checkboxes persist, but are not shown on the
+        # operator screen.
         overlay_box = QGroupBox("Camera Overlay")
+        self.overlay_box = overlay_box
         og = QGridLayout(overlay_box)
         og.setContentsMargins(6, 8, 6, 6)
         og.setSpacing(2)
@@ -4145,9 +4222,10 @@ class MainWindow(QMainWindow):
         og.addWidget(self.overlay_labels_check, 1, 0)
         og.addWidget(self.overlay_grades_check, 1, 1)
         og.addWidget(self.overlay_fail_banner_check, 2, 0, 1, 2)
-        side.addWidget(overlay_box)
+        overlay_box.hide()
 
         saving_box = QGroupBox("Image Saving")
+        self.saving_box = saving_box
         sg = QGridLayout(saving_box)
         sg.setContentsMargins(6, 8, 6, 6)
         sg.setSpacing(4)
@@ -4159,7 +4237,7 @@ class MainWindow(QMainWindow):
         self.save_fail_images_check.stateChanged.connect(lambda _state=None: self.on_image_saving_changed())
         sg.addWidget(self.save_pass_images_check, 0, 0)
         sg.addWidget(self.save_fail_images_check, 0, 1)
-        side.addWidget(saving_box)
+        saving_box.hide()
 
         plc = QGroupBox("Machine Interface")
         pg = QGridLayout(plc)
