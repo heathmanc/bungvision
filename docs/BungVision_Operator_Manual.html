@@ -139,6 +139,13 @@
     nav.toc ol{grid-template-columns:1fr}
     body{font-size:17px}
   }
+  @media print{
+    .band{-webkit-print-color-adjust:exact;print-color-adjust:exact}
+    figure,table,.call,nav.toc,ol.steps>li{break-inside:avoid}
+    .sec-head,h2.title,h3{break-after:avoid}
+    section{border-top:none;padding-top:26px}
+    a{color:inherit;text-decoration:none}
+  }
 </style>
 
 <div class="band">
