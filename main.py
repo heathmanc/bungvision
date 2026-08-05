@@ -45,7 +45,7 @@ from PySide6.QtWidgets import (
 
 from camera_backend import BaslerPylonCamera, create_camera_backend, list_basler_cameras
 
-APP_TITLE = "BungVision Python Line-Side HMI v0.9.106 Fixed Side Pane"
+APP_TITLE = "BungVision Python Line-Side HMI v0.9.107 Bunsen Valve Wording"
 ROOT = Path(__file__).resolve().parent
 LOG_DIR = ROOT / "logs"
 FAIL_DIR = ROOT / "fail_snapshots"
@@ -1349,7 +1349,7 @@ def validate_six_bung_pattern(local_points: List[Tuple[float, float]], tolerance
     six assigned bung centers in the battery's local coordinate space.
     """
     if len(local_points) != 6:
-        return {"ok": False, "pattern": "", "score": 0.0, "reason": f"Need exactly 6 assigned bungs, got {len(local_points)}"}
+        return {"ok": False, "pattern": "", "score": 0.0, "reason": f"Need exactly 6 assigned Bunsen valves, got {len(local_points)}"}
 
     pts = np.asarray(local_points, dtype=np.float32)
     tol = max(0.05, min(0.75, float(tolerance_percent) / 100.0))
@@ -3017,18 +3017,18 @@ class SettingsDialog(QDialog):
         self.committed_track_iou_spin_local = self._spin(25, 0, 100, 1)
         self.require_full_view_local = QCheckBox("Require full view before grading")
         self.full_view_margin_spin_local = self._spin(3, 0, 25, 1)
-        self.pattern_validation_local = QCheckBox("Validate bung pattern")
+        self.pattern_validation_local = QCheckBox("Validate Bunsen valve pattern")
         self.pattern_tolerance_spin_local = self._spin(25, 5, 75, 1)
-        self._add_grid_row(igrid, 0, 0, "Bungs", self.expected_spin_local, "Expected bung count per battery before a PASS can commit.")
+        self._add_grid_row(igrid, 0, 0, "Bunsen Valves", self.expected_spin_local, "Expected Bunsen valve count per battery before a PASS can commit.")
         self._add_grid_row(igrid, 0, 1, "Debounce", self.debounce_spin_local, "Frames a PASS/FAIL must stay stable before it is counted.")
-        self._add_grid_row(igrid, 1, 0, "Entry Grace", self.entry_grace_spin_local, "WAIT frames after a new battery appears so bungs can enter view.")
+        self._add_grid_row(igrid, 1, 0, "Entry Grace", self.entry_grace_spin_local, "WAIT frames after a new battery appears so Bunsen valves can enter view.")
         self._add_grid_row(igrid, 1, 1, "Clear Frames", self.clear_spin_local, "Frames with no match before a tracked battery is cleared.")
         self._add_grid_row(igrid, 2, 0, "Match px", self.match_distance_spin_local, "Maximum center movement allowed when matching a battery track.")
         self._add_grid_row(igrid, 2, 1, "Track IoU %", self.track_match_iou_spin_local, "Overlap threshold used to keep moving batteries tied to the same ID.")
         self._add_grid_row(igrid, 3, 0, "Locked IoU %", self.committed_track_iou_spin_local, "Overlap required to keep a committed PASS/FAIL locked while visible.")
         igrid.addWidget(self._check_item(self.require_full_view_local, "Hold a partial infeed/edge battery in WAIT instead of grading it FAIL before the full lid is visible."), 3, 2, 1, 2)
         self._add_grid_row(igrid, 4, 0, "Full View Margin %", self.full_view_margin_spin_local, "Battery must be this far from the frame edge before PASS/FAIL grading can commit.")
-        igrid.addWidget(self._check_item(self.pattern_validation_local, "Require the 6 assigned bungs to form either a clean 6-in-row pattern or a 2x3 pattern before PASS can commit."), 4, 2, 1, 2)
+        igrid.addWidget(self._check_item(self.pattern_validation_local, "Require the 6 assigned Bunsen valves to form either a clean 6-in-row pattern or a 2x3 pattern before PASS can commit."), 4, 2, 1, 2)
         self._add_grid_row(igrid, 5, 0, "Pattern Tol %", self.pattern_tolerance_spin_local, "Geometry tolerance for row straightness, spacing consistency, and 2x3 alignment.")
         igrid.setRowStretch(6, 1)
 
@@ -3734,7 +3734,7 @@ class CustomRejectClassesDialog(QDialog):
 
         desc = QLabel(
             "Add YOLO class names below. When any detection matches one of these labels\n"
-            "the PLC reject latch fires immediately, regardless of bung count.\n"
+            "the PLC reject latch fires immediately, regardless of Bunsen valve count.\n"
             "Names are case-insensitive. Example: <b>battery_down</b>"
         )
         desc.setWordWrap(True)
@@ -4281,7 +4281,7 @@ class MainWindow(QMainWindow):
         # Keep the backing history table for CSV/export/internal calls, but do not show
         # the Previous/Recent Inspections panel on the operator screen.
         self.table = QTableWidget(0, 5)
-        self.table.setHorizontalHeaderLabels(["Time", "Result", "Bungs", "Reason", "FPS"])
+        self.table.setHorizontalHeaderLabels(["Time", "Result", "Bunsen Valves", "Reason", "FPS"])
         self.table.verticalHeader().setVisible(False)
         self.table.setAlternatingRowColors(True)
         self.table.hide()
@@ -5749,7 +5749,7 @@ class MainWindow(QMainWindow):
             if grade.status == "FAIL" and tr.get("age", 0) <= self.entry_grace_frames:
                 remaining = max(0, self.entry_grace_frames - tr.get("age", 0) + 1)
                 grade.status = "WAIT"
-                grade.reason = f"Waiting for bungs: {remaining} frames"
+                grade.reason = f"Waiting for Bunsen valves: {remaining} frames"
                 tr["status_key"] = ("WAIT", grade.bung_count, grade.reason)
                 tr["stable"] = 1
                 tr["logged"] = False
@@ -6157,9 +6157,9 @@ class MainWindow(QMainWindow):
             if grade.pattern_ok is False:
                 return "Pattern invalid"
             if int(grade.bung_count) < int(grade.expected_bungs):
-                return "Missing bungs"
+                return "Missing Bunsen valves"
             if int(grade.bung_count) > int(grade.expected_bungs):
-                return "Extra bungs"
+                return "Extra Bunsen valves"
         except Exception:
             pass
         return "Other"
@@ -6384,7 +6384,7 @@ class MainWindow(QMainWindow):
             pattern_info = {"ok": None, "pattern": "", "reason": "", "score": 0.0}
             if not full_view_ok:
                 status = "WAIT"
-                reason = f"Waiting for full battery view / infeed gate: {count}/{expected} bungs{model_note}{ownership_note}"
+                reason = f"Waiting for full battery view / infeed gate: {count}/{expected} Bunsen valves{model_note}{ownership_note}"
             elif count == expected:
                 if bool(getattr(self, "enable_pattern_validation", True)) and int(expected) == 6:
                     local_points = [normalized_point_in_detection(batt, detection_center(bungs[i])) for i in assigned_indices]
@@ -6394,16 +6394,16 @@ class MainWindow(QMainWindow):
                     )
                     if pattern_info.get("ok"):
                         status = "PASS"
-                        reason = f"{count}/{expected} bungs, pattern {pattern_info.get('pattern')}{model_note}{ownership_note}"
+                        reason = f"{count}/{expected} Bunsen valves, pattern {pattern_info.get('pattern')}{model_note}{ownership_note}"
                     else:
                         status = "FAIL"
-                        reason = f"{count}/{expected} bungs, {pattern_info.get('reason', 'pattern invalid')}{model_note}{ownership_note}"
+                        reason = f"{count}/{expected} Bunsen valves, {pattern_info.get('reason', 'pattern invalid')}{model_note}{ownership_note}"
                 else:
                     status = "PASS"
-                    reason = f"{count}/{expected} bungs{model_note}{ownership_note}"
+                    reason = f"{count}/{expected} Bunsen valves{model_note}{ownership_note}"
             else:
                 status = "FAIL"
-                reason = f"{count}/{expected} bungs{model_note}{ownership_note}"
+                reason = f"{count}/{expected} Bunsen valves{model_note}{ownership_note}"
 
             grades.append(
                 BatteryGrade(
@@ -7146,7 +7146,7 @@ class MainWindow(QMainWindow):
         checks.append(("Camera source", self.source_edit.text().strip() or "0"))
         checks.append(("Model loaded", "YES" if self.model_runner.model is not None else "NO"))
         checks.append(("Model path", getattr(self.model_runner, "path", "") or self.model_edit.text().strip() or "none"))
-        checks.append(("Expected bungs", str(self._spin_value("expected_spin", 6))))
+        checks.append(("Expected Bunsen valves", str(self._spin_value("expected_spin", 6))))
         checks.append(("Confidence", f"{self._spin_value('conf_spin', 25)}%"))
         checks.append(("YOLO image size", str(self._spin_value("imgsz_spin", 736))))
         checks.append(("YOLO IoU", f"{float(getattr(self, 'yolo_iou', 0.45)):.2f}"))
