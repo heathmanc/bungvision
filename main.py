@@ -45,7 +45,7 @@ from PySide6.QtWidgets import (
 
 from camera_backend import BaslerPylonCamera, create_camera_backend, list_basler_cameras
 
-APP_TITLE = "BungVision Python Line-Side HMI v0.9.108 On-Pattern Valve Count"
+APP_TITLE = "BungVision Python Line-Side HMI v0.9.109 Vertical Control Column"
 ROOT = Path(__file__).resolve().parent
 LOG_DIR = ROOT / "logs"
 FAIL_DIR = ROOT / "fail_snapshots"
@@ -2032,11 +2032,49 @@ class CameraWidget(QWidget):
             p.end()
 
 class Pill(QLabel):
-    def __init__(self, text: str, tone: str = "neutral"):
+    def __init__(self, text: str, tone: str = "neutral", compact: bool = False):
         super().__init__(text)
         self.setAlignment(Qt.AlignCenter)
-        self.setMinimumHeight(28)
+        self.compact = bool(compact)
+        if self.compact:
+            # Machine-interface pills: small status indicators, not headline
+            # elements. The font is set on the widget (not only in the
+            # stylesheet) so fontMetrics() stays accurate for pane sizing.
+            f = self.font()
+            f.setPixelSize(10)
+            f.setBold(True)
+            self.setFont(f)
+            self.setMinimumHeight(19)
+        else:
+            self.setMinimumHeight(28)
+        self._full_text = str(text)
         self.set_tone(tone)
+
+    # Compact (machine-interface) status text — camera mode, PLC errors — can be
+    # long and variable. Elide it to the pill's width and keep the full string in
+    # the tooltip so a long message can never widen or clip the fixed-width
+    # control column. Header chips size to their own text and are left alone.
+    def setText(self, text):
+        self._full_text = str(text)
+        if not getattr(self, "compact", False):
+            super().setText(self._full_text)
+            return
+        self.setToolTip(self._full_text)
+        super().setText(self._elided_text(self._full_text))
+
+    def _elided_text(self, text: str) -> str:
+        avail = self.width() - 16
+        if avail <= 24:
+            return text
+        return self.fontMetrics().elidedText(str(text), Qt.ElideRight, avail)
+
+    def resizeEvent(self, event):
+        super().resizeEvent(event)
+        if not getattr(self, "compact", False):
+            return
+        full = getattr(self, "_full_text", None)
+        if full:
+            QLabel.setText(self, self._elided_text(full))
 
     def set_tone(self, tone: str):
         colors = {
@@ -2047,7 +2085,43 @@ class Pill(QLabel):
             "neutral": ("#1e293b", "#cbd5e1", "#475569"),
         }
         bg, fg, border = colors.get(tone, colors["neutral"])
-        self.setStyleSheet(f"QLabel {{ background:{bg}; color:{fg}; border:1px solid {border}; border-radius:14px; padding:4px 10px; font-weight:700; }}")
+        if self.compact:
+            self.setStyleSheet(f"QLabel {{ background:{bg}; color:{fg}; border:1px solid {border}; border-radius:9px; padding:1px 6px; }}")
+        else:
+            self.setStyleSheet(f"QLabel {{ background:{bg}; color:{fg}; border:1px solid {border}; border-radius:14px; padding:4px 10px; font-weight:700; }}")
+
+
+class CompactStat(QFrame):
+    """One-line stat strip.
+
+    Same set_value(value, sub) API as MetricCard, but laid out horizontally so a
+    secondary readout (inference FPS / latency) costs one row instead of a full
+    card's worth of vertical space.
+    """
+
+    def __init__(self, title: str, value: str, sub: str = "", tone: str = "info"):
+        super().__init__()
+        self.setObjectName("CompactStat")
+        self.title = QLabel(title)
+        self.value = QLabel(value)
+        self.sub = QLabel(sub)
+        self.title.setStyleSheet("color:#94a3b8; font-size:10px; font-weight:800; letter-spacing:1px; background:transparent; border:none;")
+        self.value.setStyleSheet("color:white; font-size:13px; font-weight:900; background:transparent; border:none;")
+        self.sub.setStyleSheet("color:#64748b; font-size:11px; background:transparent; border:none;")
+        lay = QHBoxLayout(self)
+        lay.setContentsMargins(10, 2, 10, 2)
+        lay.setSpacing(7)
+        lay.addWidget(self.title)
+        lay.addStretch(1)
+        lay.addWidget(self.value)
+        lay.addWidget(self.sub)
+        border = {"pass": "#10b981", "fail": "#ef4444", "warn": "#f59e0b", "info": "#38bdf8", "neutral": "#334155"}.get(tone, "#334155")
+        self.setStyleSheet(f"QFrame#CompactStat {{ background:#0f172a; border:1px solid {border}; border-radius:12px; }}")
+
+    def set_value(self, value: str, sub: str = ""):
+        self.value.setText(value)
+        if sub:
+            self.sub.setText(sub)
 
 class MetricCard(QFrame):
     def __init__(self, title: str, value: str, sub: str = "", tone: str = "neutral"):
@@ -4172,27 +4246,29 @@ class MainWindow(QMainWindow):
         side.setSpacing(5)
         side_widget.setStyleSheet(
             "QPushButton { background:#2563eb; color:white; border:none;"
-            " padding:4px 6px; border-radius:9px; font-size:12px; font-weight:800; }"
+            " padding:3px 6px; border-radius:8px; }"
             "QPushButton:hover { background:#3b82f6; }"
             "QPushButton:pressed { background:#1d4ed8; }"
             "QGroupBox { margin-top:9px; padding:3px; font-size:12px; }"
             "QGroupBox::title { subcontrol-origin:margin; subcontrol-position:top left;"
             " left:10px; padding:0 4px; }"
             "QCheckBox { font-size:11px; spacing:4px; }"
-            "QComboBox, QLineEdit, QSpinBox { padding:2px 5px; }"
+            "QComboBox, QLineEdit, QSpinBox { padding:2px 5px; font-size:11px; }"
         )
         metric_grid = QGridLayout()
         metric_grid.setSpacing(5)
         self.pass_rate_card = MetricCard("PASS RATE", "--", "no inspections", "neutral")
         self.reject_card = MetricCard("REJECTS", "0", "current session", "fail")
-        self.infer_card = MetricCard("INFERENCE", "-- FPS", "-- ms", "info")
+        # Inference is a diagnostic readout, not a headline number: keep it to a
+        # single strip instead of a full-width card.
+        self.infer_card = CompactStat("INFERENCE", "-- FPS", "-- ms", "info")
         # v0.9.77: keep the operator screen clean. Preview/camera/paint/skip
         # performance diagnostics remain in the debug PROFILE log, but the visible
         # HMI only shows inference FPS and inference timing.
         metric_grid.addWidget(self.pass_rate_card, 0, 0)
         metric_grid.addWidget(self.reject_card, 0, 1)
-        metric_grid.addWidget(self.infer_card, 1, 0, 1, 2)
         side.addLayout(metric_grid)
+        side.addWidget(self.infer_card)
 
         # Runtime controls exist as widgets but live in the Settings popup, not on the main operator screen.
         self.source_edit = QLineEdit("0")
@@ -4295,19 +4371,37 @@ class MainWindow(QMainWindow):
         self.preview_size_combo.setToolTip("Set the camera preview width as a fraction of the window width.")
         self.preview_size_combo.currentTextChanged.connect(self._apply_preview_size)
 
-        cg.addWidget(self.open_btn, 0, 0)
-        cg.addWidget(self.close_btn, 0, 1)
-        cg.addWidget(self.load_btn, 1, 0)
-        cg.addWidget(self.settings_btn, 1, 1)
-        cg.addWidget(self.reset_reject_btn, 2, 0)
-        cg.addWidget(self.reset_btn, 2, 1)
-        cg.addWidget(self.summary_btn, 3, 0, 1, 2)
+        # Vertical button stack. Buttons are sized to fit the longest label
+        # instead of being stretched across the pane, so they read as controls
+        # rather than banners.
+        stack = [
+            self.open_btn, self.close_btn, self.load_btn, self.settings_btn,
+            self.reset_reject_btn, self.reset_btn, self.summary_btn,
+        ]
+        btn_font = self.font()
+        btn_font.setPixelSize(12)
+        btn_font.setBold(True)
+        btn_w = 0
+        for b in stack:
+            b.setFont(btn_font)
+            btn_w = max(btn_w, b.fontMetrics().horizontalAdvance(b.text()))
+        btn_w = max(150, btn_w + 30)
+        for row, b in enumerate(stack):
+            b.setFixedSize(btn_w, 27)
+            cg.addWidget(b, row, 0, Qt.AlignHCenter)
         # Reject Classes now lives in the Settings dialog (Display tab); the button
         # object is kept for internal references but is not shown on the operator screen.
         self.reject_classes_btn.hide()
-        cg.addWidget(self.bypass_check, 4, 0, 1, 2)
-        cg.addWidget(preview_size_label, 5, 0)
-        cg.addWidget(self.preview_size_combo, 5, 1)
+        cg.addWidget(self.bypass_check, len(stack), 0, Qt.AlignHCenter)
+        preview_row = QWidget()
+        prow = QHBoxLayout(preview_row)
+        prow.setContentsMargins(0, 0, 0, 0)
+        prow.setSpacing(6)
+        preview_size_label.setStyleSheet("font-size:11px;")
+        self.preview_size_combo.setFixedWidth(74)
+        prow.addWidget(preview_size_label)
+        prow.addWidget(self.preview_size_combo)
+        cg.addWidget(preview_row, len(stack) + 1, 0, Qt.AlignHCenter)
         side.addWidget(controls)
 
         # Camera Overlay and Image Saving controls have moved to the Settings
@@ -4363,13 +4457,15 @@ class MainWindow(QMainWindow):
         plc = QGroupBox("Machine Interface")
         pg = QGridLayout(plc)
         pg.setContentsMargins(6, 8, 6, 6)
-        pg.setSpacing(4)
-        self.heartbeat_pill = Pill("Heartbeat SIM", "warn")
-        self.stop_output_pill = Pill("Stop Output OFF", "neutral")
-        self.alarm_pill = Pill("Alarm OFF", "neutral")
-        self.ready_pill = Pill("Not Ready", "warn")
-        self.camera_actual_pill = Pill("Actual Camera --", "neutral")
-        self.plc_write_pill = Pill("PLC Writes OFF", "neutral")
+        pg.setSpacing(3)
+        # Compact pills: these are at-a-glance status indicators, so they are
+        # deliberately smaller than the headline chips in the window header.
+        self.heartbeat_pill = Pill("Heartbeat SIM", "warn", compact=True)
+        self.stop_output_pill = Pill("Stop Output OFF", "neutral", compact=True)
+        self.alarm_pill = Pill("Alarm OFF", "neutral", compact=True)
+        self.ready_pill = Pill("Not Ready", "warn", compact=True)
+        self.camera_actual_pill = Pill("Actual Camera --", "neutral", compact=True)
+        self.plc_write_pill = Pill("PLC Writes OFF", "neutral", compact=True)
         pg.addWidget(self.heartbeat_pill, 0, 0)
         pg.addWidget(self.stop_output_pill, 0, 1)
         pg.addWidget(self.alarm_pill, 1, 0)
@@ -4701,30 +4797,19 @@ class MainWindow(QMainWindow):
             cam.setMaximumWidth(max(cam.minimumWidth(), int(avail * frac)))
 
     def _lock_side_pane_width(self):
-        """Lock the control column to a fixed width sized for its worst case.
+        """Lock the control column to a fixed width sized for its fixed content.
 
-        The widest elements are the full-span Machine-Interface pills, whose
-        text is dynamic. Compute the pixel width of their worst-case strings via
-        the pill's own font metrics (deterministic and font-accurate on the
-        target system), add the pill/group/layout chrome, and lock the pane to
-        that. Because the width is fixed, runtime text can never move the pane.
+        Width follows what the static content actually needs (button stack,
+        metric cards, group chrome) on the target system's font metrics. Long
+        dynamic status text is deliberately excluded: those pills elide to the
+        pane width and keep the full string in their tooltip, so runtime text can
+        never widen, clip, or shift the column.
         """
         sw = getattr(self, "_side_content", None)
         if sw is None:
             return
-        # Worst-case full-span pill strings (camera detail line; PLC write error).
-        worst_texts = [
-            "Actual 2592x1944 @ 30  ROI 2592x1944+9999+9999",
-            "PLC Writes WRITE ERROR: TAG ERROR: reset_req...",
-        ]
-        pill = getattr(self, "plc_write_pill", None)
-        fm = pill.fontMetrics() if pill is not None else self.fontMetrics()
-        text_w = max(fm.horizontalAdvance(t) for t in worst_texts)
-        # Chrome around a full-span pill: pill padding (2*10) + border (2) +
-        # Machine-Interface group padding/border + side/group margins. Use a
-        # comfortable allowance so the text never touches the edges.
-        chrome = 56
-        width = max(300, text_w + chrome)
+        hint = int(sw.sizeHint().width())
+        width = max(260, min(360, hint + 12))
         sw.setFixedWidth(width)
 
     def resizeEvent(self, event):
