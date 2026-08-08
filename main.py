@@ -45,7 +45,7 @@ from PySide6.QtWidgets import (
 
 from camera_backend import BaslerPylonCamera, create_camera_backend, list_basler_cameras
 
-APP_TITLE = "BungVision Python Line-Side HMI v0.9.107 Bunsen Valve Wording"
+APP_TITLE = "BungVision Python Line-Side HMI v0.9.108 On-Pattern Valve Count"
 ROOT = Path(__file__).resolve().parent
 LOG_DIR = ROOT / "logs"
 FAIL_DIR = ROOT / "fail_snapshots"
@@ -1408,6 +1408,106 @@ def validate_six_bung_pattern(local_points: List[Tuple[float, float]], tolerance
         pattern = "2x3?"
         score = grid_score
     return {"ok": False, "pattern": pattern, "score": round(float(score), 3), "reason": reason}
+
+
+def _two_means_1d(values: np.ndarray, iters: int = 20) -> Tuple[float, float]:
+    """Tiny robust 1-D k=2 clustering. Returns the two cluster centers (low, high)."""
+    v = np.sort(np.asarray(values, dtype=np.float32))
+    c1 = float(np.percentile(v, 25))
+    c2 = float(np.percentile(v, 75))
+    if c2 - c1 < 1e-6:
+        c2 = c1 + 1e-3
+    for _ in range(iters):
+        mid = (c1 + c2) / 2.0
+        g1 = v[v <= mid]
+        g2 = v[v > mid]
+        if g1.size:
+            c1 = float(np.mean(g1))
+        if g2.size:
+            c2 = float(np.mean(g2))
+    return (c1, c2) if c1 <= c2 else (c2, c1)
+
+
+def fit_bung_pattern(local_points: List[Tuple[float, float]], expected: int = 6,
+                     tol: float = 0.25) -> Dict[str, Any]:
+    """Auto-detect a single-row or 2x3 Bunsen-valve layout and count only the
+    valves that actually sit on that pattern.
+
+    Unlike a pass/fail geometry check, this *filters* the detections: any point
+    that is not on the fitted row (or grid) — a terminal post, a mounting-rail
+    hole, a stray box — is dropped and does NOT contribute to the count, so an
+    off-pattern false detection cannot inflate the valve total. Spacing along the
+    row is not constrained, so variably spaced rows are accepted. The layout
+    (row vs 2x3) is auto-detected from the point spread; the expected count is
+    always ``expected`` (6).
+
+    NOTE: this is geometry only. A false valve that lands exactly on a real seat
+    (e.g. a deep empty hole read as a valve) is on-pattern and still counted —
+    that case must be fixed in the detector, not here.
+
+    Returns: count (on-pattern), pattern ("6-row"/"2x3"/"none"), inliers (index
+    list into local_points), ok (count == expected), reason.
+    """
+    n = len(local_points)
+    if n == 0:
+        return {"count": 0, "pattern": "none", "inliers": [], "ok": False,
+                "reason": "no Bunsen valves detected"}
+
+    P = np.asarray(local_points, dtype=np.float32)
+    u, v = P[:, 0], P[:, 1]
+    # Band half-width across the row, and the minimum row-to-row separation that
+    # counts as a grid. Both derive from the operator tolerance.
+    band = float(max(0.06, min(0.22, tol * 0.60)))
+    grid_sep = float(max(0.14, min(0.50, tol * 0.80)))
+
+    # The row runs along the axis with the larger spread; the *other* axis
+    # carries the single-band (row) or two-band (grid) structure.
+    span_u = float(np.percentile(u, 90) - np.percentile(u, 10))
+    span_v = float(np.percentile(v, 90) - np.percentile(v, 10))
+    across = v if span_u >= span_v else u
+    idx = np.arange(n)
+
+    def keep_band(center: float, pool: np.ndarray, cap: int) -> np.ndarray:
+        d = np.abs(across[pool] - center)
+        keep = pool[d <= band]
+        if keep.size > cap:  # keep the ones closest to the line
+            keep = keep[np.argsort(np.abs(across[keep] - center))[:cap]]
+        return keep
+
+    # --- Single-row hypothesis: one band about the median across-value ---
+    row_center = float(np.median(across))
+    row_keep = keep_band(row_center, idx, expected)
+    row_count = int(row_keep.size)
+
+    # --- Grid hypothesis: two across-bands via robust 1-D 2-means ---
+    grid_keep = np.array([], dtype=int)
+    grid_count = 0
+    if n >= 4:
+        lc, hc = _two_means_1d(across)
+        if (hc - lc) >= grid_sep:
+            low = idx[np.abs(across - lc) <= np.abs(across - hc)]
+            high = idx[np.abs(across - hc) < np.abs(across - lc)]
+            if low.size >= 2 and high.size >= 2:
+                cap = expected // 2 if expected % 2 == 0 else expected
+                gk = np.concatenate([keep_band(lc, low, cap), keep_band(hc, high, cap)])
+                grid_keep = gk
+                grid_count = int(gk.size)
+
+    # Prefer whichever hypothesis explains more on-pattern valves.
+    if grid_count >= 4 and grid_count >= row_count:
+        keep = sorted(int(i) for i in grid_keep)
+        pattern = "2x3"
+    else:
+        keep = sorted(int(i) for i in row_keep)
+        pattern = "6-row"
+
+    count = len(keep)
+    dropped = n - count
+    reason = f"{pattern} {count}/{expected} on-pattern" + (
+        f", dropped {dropped} off-pattern" if dropped else "")
+    return {"count": count, "pattern": pattern, "inliers": keep,
+            "ok": count == int(expected), "reason": reason}
+
 
 def clamp_box(box: Box, w: int, h: int) -> Box:
     x1, y1, x2, y2 = box
@@ -3028,8 +3128,8 @@ class SettingsDialog(QDialog):
         self._add_grid_row(igrid, 3, 0, "Locked IoU %", self.committed_track_iou_spin_local, "Overlap required to keep a committed PASS/FAIL locked while visible.")
         igrid.addWidget(self._check_item(self.require_full_view_local, "Hold a partial infeed/edge battery in WAIT instead of grading it FAIL before the full lid is visible."), 3, 2, 1, 2)
         self._add_grid_row(igrid, 4, 0, "Full View Margin %", self.full_view_margin_spin_local, "Battery must be this far from the frame edge before PASS/FAIL grading can commit.")
-        igrid.addWidget(self._check_item(self.pattern_validation_local, "Require the 6 assigned Bunsen valves to form either a clean 6-in-row pattern or a 2x3 pattern before PASS can commit."), 4, 2, 1, 2)
-        self._add_grid_row(igrid, 5, 0, "Pattern Tol %", self.pattern_tolerance_spin_local, "Geometry tolerance for row straightness, spacing consistency, and 2x3 alignment.")
+        igrid.addWidget(self._check_item(self.pattern_validation_local, "Auto-detect the single-row or 2x3 layout and count only Bunsen valves that sit on it. Off-pattern detections (terminals, mounting holes, strays) are ignored so they cannot inflate the count. Row spacing is not constrained."), 4, 2, 1, 2)
+        self._add_grid_row(igrid, 5, 0, "Pattern Tol %", self.pattern_tolerance_spin_local, "How far off the fitted row/grid a valve may sit and still be counted. Higher = looser (more forgiving of skew, but off-pattern items are more likely to count).")
         igrid.setRowStretch(6, 1)
 
         capture = QWidget()
@@ -6382,28 +6482,35 @@ class MainWindow(QMainWindow):
                 )
 
             pattern_info = {"ok": None, "pattern": "", "reason": "", "score": 0.0}
+            pattern_note = ""
+            # When pattern validation is on, count only the valves that sit on the
+            # auto-detected row/grid. Off-pattern detections (terminals, rail
+            # holes, strays) are dropped so they cannot inflate the count.
+            if bool(getattr(self, "enable_pattern_validation", True)) and int(expected) == 6 and len(assigned_indices) > 0:
+                tol = float(getattr(self, "pattern_tolerance_percent", 25.0)) / 100.0
+                local_points = [normalized_point_in_detection(batt, detection_center(bungs[i])) for i in assigned_indices]
+                fit = fit_bung_pattern(local_points, expected=int(expected), tol=tol)
+                keep = fit.get("inliers") or list(range(len(assigned_indices)))
+                dropped = len(assigned_indices) - len(keep)
+                assigned_indices = [assigned_indices[k] for k in keep]
+                inside = [bungs[i].box for i in assigned_indices]
+                count = len(assigned_indices)
+                pattern_info = {"ok": count == int(expected), "pattern": fit.get("pattern", ""),
+                                "reason": fit.get("reason", ""), "score": 0.0}
+                if fit.get("pattern"):
+                    pattern_note = f", pattern {fit.get('pattern')}"
+                if dropped:
+                    pattern_note += f" ({dropped} off-pattern ignored)"
+
             if not full_view_ok:
                 status = "WAIT"
                 reason = f"Waiting for full battery view / infeed gate: {count}/{expected} Bunsen valves{model_note}{ownership_note}"
             elif count == expected:
-                if bool(getattr(self, "enable_pattern_validation", True)) and int(expected) == 6:
-                    local_points = [normalized_point_in_detection(batt, detection_center(bungs[i])) for i in assigned_indices]
-                    pattern_info = validate_six_bung_pattern(
-                        local_points,
-                        tolerance_percent=float(getattr(self, "pattern_tolerance_percent", 25.0)),
-                    )
-                    if pattern_info.get("ok"):
-                        status = "PASS"
-                        reason = f"{count}/{expected} Bunsen valves, pattern {pattern_info.get('pattern')}{model_note}{ownership_note}"
-                    else:
-                        status = "FAIL"
-                        reason = f"{count}/{expected} Bunsen valves, {pattern_info.get('reason', 'pattern invalid')}{model_note}{ownership_note}"
-                else:
-                    status = "PASS"
-                    reason = f"{count}/{expected} Bunsen valves{model_note}{ownership_note}"
+                status = "PASS"
+                reason = f"{count}/{expected} Bunsen valves{pattern_note}{model_note}{ownership_note}"
             else:
                 status = "FAIL"
-                reason = f"{count}/{expected} Bunsen valves{model_note}{ownership_note}"
+                reason = f"{count}/{expected} Bunsen valves{pattern_note}{model_note}{ownership_note}"
 
             grades.append(
                 BatteryGrade(
