@@ -381,6 +381,8 @@
       <tr><td>Frames per second look low</td><td>The camera decode is slow</td><td>Supervisor: set the camera to the GStreamer option so the hardware helps decode.</td></tr>
       <tr><td>Good batteries show FAIL</td><td>Pattern check is too strict, or a Bunsen valve is dirty/hidden</td><td>Clean the battery top. If it keeps happening, a supervisor can raise the Pattern Tolerance.</td></tr>
       <tr><td>Machine will not run even on PASS</td><td>PLC not connected, or not "Ready"</td><td>Check the <b>PLC Writes</b> and <b>Ready</b> lights. If not green, get a supervisor.</td></tr>
+      <tr><td>Machine lights flicker on and off by themselves (Bypass, Ready, Stop)</td><td>A second copy of BungVision is open, and both are talking to the machine at once</td><td>Only one copy may run at a time. Close the extra copy. BungVision now refuses to open a second copy and will tell you one is already running.</td></tr>
+      <tr><td>Says <b>TAG CONFLICT</b> on the PLC Writes light</td><td>Two machine signals were set to the same tag name</td><td>Get a supervisor: in Settings &rarr; PLC, every signal needs its own tag name.</td></tr>
       <tr><td>Says model is not loaded</td><td>The model file did not load</td><td>Press <b>Load Model</b>. If it still fails, get a supervisor.</td></tr>
     </table>
     </div>

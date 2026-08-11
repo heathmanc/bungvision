@@ -45,7 +45,7 @@ from PySide6.QtWidgets import (
 
 from camera_backend import BaslerPylonCamera, create_camera_backend, list_basler_cameras
 
-APP_TITLE = "BungVision Python Line-Side HMI v0.9.110 PLC Tag Conflict Check"
+APP_TITLE = "BungVision Python Line-Side HMI v0.9.111 Single Instance Guard"
 ROOT = Path(__file__).resolve().parent
 LOG_DIR = ROOT / "logs"
 FAIL_DIR = ROOT / "fail_snapshots"
@@ -752,6 +752,63 @@ PLC_TAG_LONG_DESCRIPTIONS = {
     ),
 }
 
+
+
+# Held open for the life of the process so the instance lock stays held.
+_INSTANCE_LOCK_HANDLE = None
+
+
+def acquire_single_instance_lock() -> Tuple[bool, str]:
+    """Stop a second BungVision from running against the same PLC tags.
+
+    Two copies both write the full output batch about ten times a second, so the
+    PLC sees the tags alternate between the two instances' values -- a copy that
+    is not in bypass and not ready will fight a copy that is, and outputs such as
+    Bypass and Ready appear to flicker. Because Bypass suppresses the vision stop
+    request, that is a safety problem, so a second copy is refused.
+
+    Uses an exclusive flock, which the kernel drops automatically when the owning
+    process exits (even on SIGKILL), so there is no stale-lock recovery to do.
+    Set BUNGVISION_ALLOW_MULTIPLE=1 to override for development.
+
+    Returns (acquired, detail_about_existing_instance).
+    """
+    global _INSTANCE_LOCK_HANDLE
+    if str(os.environ.get("BUNGVISION_ALLOW_MULTIPLE", "")).strip().lower() in ("1", "true", "yes"):
+        return True, ""
+    try:
+        import fcntl
+    except Exception:
+        # Non-POSIX platform: skip the guard rather than block startup.
+        return True, ""
+    try:
+        handle = open(LOG_DIR / "bungvision.lock", "a+")
+    except Exception:
+        return True, ""
+    try:
+        fcntl.flock(handle.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except OSError:
+        detail = ""
+        try:
+            handle.seek(0)
+            detail = handle.read().strip()
+        except Exception:
+            pass
+        try:
+            handle.close()
+        except Exception:
+            pass
+        return False, detail
+    try:
+        handle.seek(0)
+        handle.truncate()
+        handle.write(f"pid={os.getpid()} started={dt.datetime.now().isoformat(timespec='seconds')}\n")
+        handle.flush()
+    except Exception:
+        pass
+    # Hold the handle for the life of the process so the lock stays held.
+    _INSTANCE_LOCK_HANDLE = handle
+    return True, ""
 
 
 def find_duplicate_plc_tags(tags: dict) -> List[str]:
@@ -7626,6 +7683,25 @@ def main():
     apply_global_readability_style()
     sys.argv = _argv_string_list(sys.argv)
     _write_debug_log(f"main() post-QApplication argv={sys.argv!r}")
+
+    # Refuse to start a second copy: two instances write the same PLC tags at
+    # about 10 Hz and their outputs fight, which can flicker Bypass (and Bypass
+    # suppresses the vision stop request).
+    acquired, other = acquire_single_instance_lock()
+    if not acquired:
+        _write_debug_log(f"SECOND_INSTANCE_REFUSED existing={other!r}")
+        QMessageBox.critical(
+            None, "BungVision Is Already Running",
+            "Another copy of BungVision is already running on this machine"
+            + (f"\n\nRunning copy: {other}" if other else "")
+            + "\n\nTwo copies write the same PLC tags at the same time, so the "
+              "machine sees the outputs flicker between them — including Bypass, "
+              "which suppresses the vision stop request.\n\n"
+              "Switch to the copy that is already running. If it is not on screen, "
+              "close it from the task bar (or reboot the panel) and start again.",
+        )
+        sys.exit(1)
+
     w = MainWindow()
     # On small operator panels (e.g. XGA 1024x768) maximize so the entire HMI
     # is reachable within the screen instead of opening partly off-screen.
