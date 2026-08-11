@@ -45,7 +45,7 @@ from PySide6.QtWidgets import (
 
 from camera_backend import BaslerPylonCamera, create_camera_backend, list_basler_cameras
 
-APP_TITLE = "BungVision Python Line-Side HMI v0.9.109 Vertical Control Column"
+APP_TITLE = "BungVision Python Line-Side HMI v0.9.110 PLC Tag Conflict Check"
 ROOT = Path(__file__).resolve().parent
 LOG_DIR = ROOT / "logs"
 FAIL_DIR = ROOT / "fail_snapshots"
@@ -754,6 +754,29 @@ PLC_TAG_LONG_DESCRIPTIONS = {
 
 
 
+def find_duplicate_plc_tags(tags: dict) -> List[str]:
+    """Report PLC roles that were configured to the same controller tag.
+
+    Each role (running, bypass, ready, heartbeat, ...) must own its own tag.
+    When two share one, BungVision writes both values to the same address in a
+    single batch and the last one written wins, so a steady output silently
+    carries another signal's value. The heartbeat is written near the end of the
+    batch and toggles constantly, which makes an aliased output look like it is
+    blinking on and off in time with the heartbeat.
+    """
+    by_tag: Dict[str, List[str]] = {}
+    for key, tag in (tags or {}).items():
+        name = str(tag or "").strip()
+        if not name:
+            continue
+        by_tag.setdefault(name.lower(), []).append(key)
+    conflicts = []
+    for name, keys in by_tag.items():
+        if len(keys) > 1:
+            conflicts.append(f"{' + '.join(sorted(keys))} all write '{name}'")
+    return sorted(conflicts)
+
+
 class PLCInterface:
     """Small pylogix wrapper used by the HMI.
 
@@ -766,6 +789,7 @@ class PLCInterface:
         self.enabled = False
         self.ip_address = ""
         self.tags = {key: value[0] for key, value in PLC_TAG_DEFAULTS.items()}
+        self.tag_conflicts: List[str] = []
         self._PLC = None
         self._comm = None
         self._last_error = ""
@@ -779,6 +803,15 @@ class PLCInterface:
             if key in merged and str(value).strip():
                 merged[key] = str(value).strip()
         self.tags = merged
+        self.tag_conflicts = find_duplicate_plc_tags(merged)
+        if self.tag_conflicts:
+            # Two roles pointing at one PLC tag means the last write in the batch
+            # wins, so a constant output (bypass/ready) silently takes on another
+            # signal's value -- the heartbeat is written last and toggles, so the
+            # aliased output appears to blink. Surface it loudly.
+            detail = "; ".join(self.tag_conflicts)
+            self._last_error = f"PLC TAG CONFLICT: {detail}"
+            _write_debug_log(f"PLC_TAG_CONFLICT {detail}")
         if not self.enabled:
             self.close()
             self._last_status = "SIM"
@@ -860,6 +893,12 @@ class PLCInterface:
                         self._last_status = f"WRITE ERROR: {self._last_error}"
                         self.close()
                         return self._last_status
+            if self.tag_conflicts:
+                # Writes succeeded, but the outputs are not trustworthy: two
+                # roles share a tag, so one is overwriting the other.
+                self._last_error = "PLC TAG CONFLICT: " + "; ".join(self.tag_conflicts)
+                self._last_status = "TAG CONFLICT - outputs overlap"
+                return self._last_status
             self._last_status = "CONNECTED"
             self._last_error = ""
             return self._last_status
@@ -892,6 +931,10 @@ class PLCInterface:
                     self._last_error = f"{key} / {tag}: {err}"
                     self._last_status = f"TAG ERROR: {self._last_error}"
                     return self._last_status
+            if self.tag_conflicts:
+                self._last_error = "PLC TAG CONFLICT: " + "; ".join(self.tag_conflicts)
+                self._last_status = f"TAG CONFLICT - {self._last_error}"
+                return self._last_status
             self._last_error = ""
             self._last_status = f"CONNECTED - {tested} TAGS OK"
             return self._last_status
@@ -3489,6 +3532,21 @@ class SettingsDialog(QDialog):
             for key, edit in self.plc_tag_local.items():
                 if key in p.plc_tag_edits:
                     p.plc_tag_edits[key].setText(edit.text().strip())
+        # Each PLC role needs its own tag. Sharing one makes a steady output
+        # (e.g. Bypass or Ready) take on whatever is written to that tag last,
+        # which is usually the toggling heartbeat.
+        conflicts = find_duplicate_plc_tags({k: e.text().strip() for k, e in self.plc_tag_local.items()})
+        if conflicts:
+            QMessageBox.warning(
+                self, "PLC Tag Conflict",
+                "These PLC roles are pointing at the same controller tag:\n\n  "
+                + "\n  ".join(conflicts)
+                + "\n\nEach role must have its own tag. While they overlap, the "
+                  "last value written wins, so an output such as Bypass or Ready "
+                  "will follow another signal (usually the heartbeat) instead of "
+                  "its own value.\n\nBypass suppresses the vision stop request, so "
+                  "please correct this before running production.",
+            )
 
         new_camera_settings = (
             str(getattr(p, "camera_backend", "opencv")),
