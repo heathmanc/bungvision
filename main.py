@@ -45,7 +45,7 @@ from PySide6.QtWidgets import (
 
 from camera_backend import BaslerPylonCamera, create_camera_backend, list_basler_cameras
 
-APP_TITLE = "BungVision Python Line-Side HMI v0.9.111 Single Instance Guard"
+APP_TITLE = "BungVision Python Line-Side HMI v0.9.112 Sealed Battery Support"
 ROOT = Path(__file__).resolve().parent
 LOG_DIR = ROOT / "logs"
 FAIL_DIR = ROOT / "fail_snapshots"
@@ -491,6 +491,7 @@ class BatteryGrade:
     pattern_name: str = ""
     pattern_ok: Optional[bool] = None
     pattern_reason: str = ""
+    valve_check_skipped: bool = False
 
 
 
@@ -1637,6 +1638,28 @@ def detection_suffix(label: str) -> str:
     return label.split("_", 1)[1]
 
 
+# Marker in a battery class name meaning "this battery type has no Bunsen
+# valves". Matched as a whole underscore-delimited token, so battery_sealed,
+# battery_sealed_agm and battery_agm_sealed all qualify while a name that merely
+# contains the letters (e.g. battery_unsealed) does not.
+SEALED_BATTERY_TOKEN = "sealed"
+
+
+def is_sealed_battery(label: str) -> bool:
+    """True when a battery class is marked as needing no Bunsen valves.
+
+    Keying off the class name means one rule covers every sealed battery type,
+    and a new sealed product only has to be named consistently -- no per-type
+    setup in BungVision. An unmarked/unknown battery always gets the normal
+    valve check, so the failure direction is a nuisance stop, never a battery
+    reaching the wash unchecked.
+    """
+    label = str(label or "").strip().lower()
+    if detection_kind(label) != "battery":
+        return False
+    return SEALED_BATTERY_TOKEN in label.split("_")
+
+
 
 
 def bung_matches_battery(bung_label: str, battery_label: str) -> bool:
@@ -2001,7 +2024,7 @@ class CameraWidget(QWidget):
                         p2.drawRoundedRect(QRect(rx1, ry1, rx2 - rx1, ry2 - ry1), 10, 10)
                     id_text = f"ID {grade.track_id}" if grade.track_id > 0 else "CAND"
                     line1 = f"{id_text}  {grade.status}"
-                    line2 = f"{grade.bung_count}/{grade.expected_bungs}"
+                    line2 = "SEALED" if getattr(grade, "valve_check_skipped", False) else f"{grade.bung_count}/{grade.expected_bungs}"
 
                     bx1 = min([p0 for p0, _ in grade_pts], default=rx1)
                     by1 = min([p1 for _, p1 in grade_pts], default=ry1)
@@ -6683,6 +6706,41 @@ class MainWindow(QMainWindow):
 
             pattern_info = {"ok": None, "pattern": "", "reason": "", "score": 0.0}
             pattern_note = ""
+            # Sealed battery types carry no Bunsen valves, so there is nothing to
+            # count. Skip the check entirely rather than expecting zero, so a
+            # stray detection on a sealed lid cannot stop the line. The battery is
+            # still tracked, committed and counted like any other part.
+            sealed = is_sealed_battery(batt.label)
+            if sealed:
+                # "Sealed battery" already names the type; only add the suffix when
+                # it carries extra information (e.g. battery_sealed_agm).
+                sealed_note = "" if batt_suffix == SEALED_BATTERY_TOKEN else f" [{batt_suffix}]"
+                if not full_view_ok:
+                    status = "WAIT"
+                    reason = f"Waiting for full battery view / infeed gate: sealed battery{sealed_note}"
+                else:
+                    status = "PASS"
+                    reason = f"Sealed battery - no Bunsen valve check{sealed_note}"
+                grades.append(
+                    BatteryGrade(
+                        track_id=-1,
+                        box=batt.box,
+                        confidence=batt.conf,
+                        bung_count=0,
+                        expected_bungs=0,
+                        bung_boxes=[],
+                        status=status,
+                        reason=reason,
+                        obb_points=batt.obb_points,
+                        assigned_bung_indices=[],
+                        pattern_name="",
+                        pattern_ok=None,
+                        pattern_reason="",
+                        valve_check_skipped=True,
+                    )
+                )
+                continue
+
             # When pattern validation is on, count only the valves that sit on the
             # auto-detected row/grid. Off-pattern detections (terminals, rail
             # holes, strays) are dropped so they cannot inflate the count.
@@ -6751,7 +6809,14 @@ class MainWindow(QMainWindow):
             reason = f"All {len(grades)} visible batteries passed"
             total_bungs = sum(g.bung_count for g in grades)
 
-        return InspectionResult(status, reason, len(batteries), total_bungs, expected, detections, self.fps, grades)
+        # Frame-level target: when every visible battery is a sealed type there is
+        # nothing to count, so report 0 expected. The decision panel renders that
+        # as "--" instead of a misleading 0/6.
+        frame_expected = expected
+        if grades and all(getattr(g, "valve_check_skipped", False) for g in grades):
+            frame_expected = 0
+
+        return InspectionResult(status, reason, len(batteries), total_bungs, frame_expected, detections, self.fps, grades)
 
     def _record_preview_submit(self, display_seq: int = 0) -> None:
         """Record actual frames submitted to the preview widget.
@@ -7026,7 +7091,11 @@ class MainWindow(QMainWindow):
         else:
             self.decision_label.setText(result.status)
             self.reason_label.setText(result.reason)
-        self.bung_big.setText(f"{result.bung_count}/{result.expected_bungs}")
+        # Sealed batteries have no valve target, so show "--" rather than 0/6.
+        if int(getattr(result, "expected_bungs", 0)) <= 0:
+            self.bung_big.setText("--")
+        else:
+            self.bung_big.setText(f"{result.bung_count}/{result.expected_bungs}")
         if getattr(self, "reject_latched", False):
             self.decision_frame.setStyleSheet("QFrame#DecisionFrame { background:#7f1d1d; border:2px solid #f97316; border-radius:22px; }")
         elif result.status == "PASS":
@@ -7375,7 +7444,7 @@ class MainWindow(QMainWindow):
                 lx, ly = x1, y2
             id_text = f"ID {grade.track_id}" if grade.track_id > 0 else "CAND"
             line1 = f"{id_text} {grade.status}"
-            line2 = f"{grade.bung_count}/{grade.expected_bungs}"
+            line2 = "SEALED" if getattr(grade, "valve_check_skipped", False) else f"{grade.bung_count}/{grade.expected_bungs}"
 
             if getattr(grade, "obb_points", None):
                 gx1 = int(min(p[0] for p in grade.obb_points))
