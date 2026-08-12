@@ -45,7 +45,7 @@ from PySide6.QtWidgets import (
 
 from camera_backend import BaslerPylonCamera, create_camera_backend, list_basler_cameras
 
-APP_TITLE = "BungVision Python Line-Side HMI v0.9.107 Bunsen Valve Wording"
+APP_TITLE = "BungVision Python Line-Side HMI v0.9.112 Sealed Battery Support"
 ROOT = Path(__file__).resolve().parent
 LOG_DIR = ROOT / "logs"
 FAIL_DIR = ROOT / "fail_snapshots"
@@ -491,6 +491,7 @@ class BatteryGrade:
     pattern_name: str = ""
     pattern_ok: Optional[bool] = None
     pattern_reason: str = ""
+    valve_check_skipped: bool = False
 
 
 
@@ -754,6 +755,86 @@ PLC_TAG_LONG_DESCRIPTIONS = {
 
 
 
+# Held open for the life of the process so the instance lock stays held.
+_INSTANCE_LOCK_HANDLE = None
+
+
+def acquire_single_instance_lock() -> Tuple[bool, str]:
+    """Stop a second BungVision from running against the same PLC tags.
+
+    Two copies both write the full output batch about ten times a second, so the
+    PLC sees the tags alternate between the two instances' values -- a copy that
+    is not in bypass and not ready will fight a copy that is, and outputs such as
+    Bypass and Ready appear to flicker. Because Bypass suppresses the vision stop
+    request, that is a safety problem, so a second copy is refused.
+
+    Uses an exclusive flock, which the kernel drops automatically when the owning
+    process exits (even on SIGKILL), so there is no stale-lock recovery to do.
+    Set BUNGVISION_ALLOW_MULTIPLE=1 to override for development.
+
+    Returns (acquired, detail_about_existing_instance).
+    """
+    global _INSTANCE_LOCK_HANDLE
+    if str(os.environ.get("BUNGVISION_ALLOW_MULTIPLE", "")).strip().lower() in ("1", "true", "yes"):
+        return True, ""
+    try:
+        import fcntl
+    except Exception:
+        # Non-POSIX platform: skip the guard rather than block startup.
+        return True, ""
+    try:
+        handle = open(LOG_DIR / "bungvision.lock", "a+")
+    except Exception:
+        return True, ""
+    try:
+        fcntl.flock(handle.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except OSError:
+        detail = ""
+        try:
+            handle.seek(0)
+            detail = handle.read().strip()
+        except Exception:
+            pass
+        try:
+            handle.close()
+        except Exception:
+            pass
+        return False, detail
+    try:
+        handle.seek(0)
+        handle.truncate()
+        handle.write(f"pid={os.getpid()} started={dt.datetime.now().isoformat(timespec='seconds')}\n")
+        handle.flush()
+    except Exception:
+        pass
+    # Hold the handle for the life of the process so the lock stays held.
+    _INSTANCE_LOCK_HANDLE = handle
+    return True, ""
+
+
+def find_duplicate_plc_tags(tags: dict) -> List[str]:
+    """Report PLC roles that were configured to the same controller tag.
+
+    Each role (running, bypass, ready, heartbeat, ...) must own its own tag.
+    When two share one, BungVision writes both values to the same address in a
+    single batch and the last one written wins, so a steady output silently
+    carries another signal's value. The heartbeat is written near the end of the
+    batch and toggles constantly, which makes an aliased output look like it is
+    blinking on and off in time with the heartbeat.
+    """
+    by_tag: Dict[str, List[str]] = {}
+    for key, tag in (tags or {}).items():
+        name = str(tag or "").strip()
+        if not name:
+            continue
+        by_tag.setdefault(name.lower(), []).append(key)
+    conflicts = []
+    for name, keys in by_tag.items():
+        if len(keys) > 1:
+            conflicts.append(f"{' + '.join(sorted(keys))} all write '{name}'")
+    return sorted(conflicts)
+
+
 class PLCInterface:
     """Small pylogix wrapper used by the HMI.
 
@@ -766,6 +847,7 @@ class PLCInterface:
         self.enabled = False
         self.ip_address = ""
         self.tags = {key: value[0] for key, value in PLC_TAG_DEFAULTS.items()}
+        self.tag_conflicts: List[str] = []
         self._PLC = None
         self._comm = None
         self._last_error = ""
@@ -779,6 +861,15 @@ class PLCInterface:
             if key in merged and str(value).strip():
                 merged[key] = str(value).strip()
         self.tags = merged
+        self.tag_conflicts = find_duplicate_plc_tags(merged)
+        if self.tag_conflicts:
+            # Two roles pointing at one PLC tag means the last write in the batch
+            # wins, so a constant output (bypass/ready) silently takes on another
+            # signal's value -- the heartbeat is written last and toggles, so the
+            # aliased output appears to blink. Surface it loudly.
+            detail = "; ".join(self.tag_conflicts)
+            self._last_error = f"PLC TAG CONFLICT: {detail}"
+            _write_debug_log(f"PLC_TAG_CONFLICT {detail}")
         if not self.enabled:
             self.close()
             self._last_status = "SIM"
@@ -860,6 +951,12 @@ class PLCInterface:
                         self._last_status = f"WRITE ERROR: {self._last_error}"
                         self.close()
                         return self._last_status
+            if self.tag_conflicts:
+                # Writes succeeded, but the outputs are not trustworthy: two
+                # roles share a tag, so one is overwriting the other.
+                self._last_error = "PLC TAG CONFLICT: " + "; ".join(self.tag_conflicts)
+                self._last_status = "TAG CONFLICT - outputs overlap"
+                return self._last_status
             self._last_status = "CONNECTED"
             self._last_error = ""
             return self._last_status
@@ -892,6 +989,10 @@ class PLCInterface:
                     self._last_error = f"{key} / {tag}: {err}"
                     self._last_status = f"TAG ERROR: {self._last_error}"
                     return self._last_status
+            if self.tag_conflicts:
+                self._last_error = "PLC TAG CONFLICT: " + "; ".join(self.tag_conflicts)
+                self._last_status = f"TAG CONFLICT - {self._last_error}"
+                return self._last_status
             self._last_error = ""
             self._last_status = f"CONNECTED - {tested} TAGS OK"
             return self._last_status
@@ -1409,6 +1510,106 @@ def validate_six_bung_pattern(local_points: List[Tuple[float, float]], tolerance
         score = grid_score
     return {"ok": False, "pattern": pattern, "score": round(float(score), 3), "reason": reason}
 
+
+def _two_means_1d(values: np.ndarray, iters: int = 20) -> Tuple[float, float]:
+    """Tiny robust 1-D k=2 clustering. Returns the two cluster centers (low, high)."""
+    v = np.sort(np.asarray(values, dtype=np.float32))
+    c1 = float(np.percentile(v, 25))
+    c2 = float(np.percentile(v, 75))
+    if c2 - c1 < 1e-6:
+        c2 = c1 + 1e-3
+    for _ in range(iters):
+        mid = (c1 + c2) / 2.0
+        g1 = v[v <= mid]
+        g2 = v[v > mid]
+        if g1.size:
+            c1 = float(np.mean(g1))
+        if g2.size:
+            c2 = float(np.mean(g2))
+    return (c1, c2) if c1 <= c2 else (c2, c1)
+
+
+def fit_bung_pattern(local_points: List[Tuple[float, float]], expected: int = 6,
+                     tol: float = 0.25) -> Dict[str, Any]:
+    """Auto-detect a single-row or 2x3 Bunsen-valve layout and count only the
+    valves that actually sit on that pattern.
+
+    Unlike a pass/fail geometry check, this *filters* the detections: any point
+    that is not on the fitted row (or grid) — a terminal post, a mounting-rail
+    hole, a stray box — is dropped and does NOT contribute to the count, so an
+    off-pattern false detection cannot inflate the valve total. Spacing along the
+    row is not constrained, so variably spaced rows are accepted. The layout
+    (row vs 2x3) is auto-detected from the point spread; the expected count is
+    always ``expected`` (6).
+
+    NOTE: this is geometry only. A false valve that lands exactly on a real seat
+    (e.g. a deep empty hole read as a valve) is on-pattern and still counted —
+    that case must be fixed in the detector, not here.
+
+    Returns: count (on-pattern), pattern ("6-row"/"2x3"/"none"), inliers (index
+    list into local_points), ok (count == expected), reason.
+    """
+    n = len(local_points)
+    if n == 0:
+        return {"count": 0, "pattern": "none", "inliers": [], "ok": False,
+                "reason": "no Bunsen valves detected"}
+
+    P = np.asarray(local_points, dtype=np.float32)
+    u, v = P[:, 0], P[:, 1]
+    # Band half-width across the row, and the minimum row-to-row separation that
+    # counts as a grid. Both derive from the operator tolerance.
+    band = float(max(0.06, min(0.22, tol * 0.60)))
+    grid_sep = float(max(0.14, min(0.50, tol * 0.80)))
+
+    # The row runs along the axis with the larger spread; the *other* axis
+    # carries the single-band (row) or two-band (grid) structure.
+    span_u = float(np.percentile(u, 90) - np.percentile(u, 10))
+    span_v = float(np.percentile(v, 90) - np.percentile(v, 10))
+    across = v if span_u >= span_v else u
+    idx = np.arange(n)
+
+    def keep_band(center: float, pool: np.ndarray, cap: int) -> np.ndarray:
+        d = np.abs(across[pool] - center)
+        keep = pool[d <= band]
+        if keep.size > cap:  # keep the ones closest to the line
+            keep = keep[np.argsort(np.abs(across[keep] - center))[:cap]]
+        return keep
+
+    # --- Single-row hypothesis: one band about the median across-value ---
+    row_center = float(np.median(across))
+    row_keep = keep_band(row_center, idx, expected)
+    row_count = int(row_keep.size)
+
+    # --- Grid hypothesis: two across-bands via robust 1-D 2-means ---
+    grid_keep = np.array([], dtype=int)
+    grid_count = 0
+    if n >= 4:
+        lc, hc = _two_means_1d(across)
+        if (hc - lc) >= grid_sep:
+            low = idx[np.abs(across - lc) <= np.abs(across - hc)]
+            high = idx[np.abs(across - hc) < np.abs(across - lc)]
+            if low.size >= 2 and high.size >= 2:
+                cap = expected // 2 if expected % 2 == 0 else expected
+                gk = np.concatenate([keep_band(lc, low, cap), keep_band(hc, high, cap)])
+                grid_keep = gk
+                grid_count = int(gk.size)
+
+    # Prefer whichever hypothesis explains more on-pattern valves.
+    if grid_count >= 4 and grid_count >= row_count:
+        keep = sorted(int(i) for i in grid_keep)
+        pattern = "2x3"
+    else:
+        keep = sorted(int(i) for i in row_keep)
+        pattern = "6-row"
+
+    count = len(keep)
+    dropped = n - count
+    reason = f"{pattern} {count}/{expected} on-pattern" + (
+        f", dropped {dropped} off-pattern" if dropped else "")
+    return {"count": count, "pattern": pattern, "inliers": keep,
+            "ok": count == int(expected), "reason": reason}
+
+
 def clamp_box(box: Box, w: int, h: int) -> Box:
     x1, y1, x2, y2 = box
     x1 = max(0, min(w - 1, int(x1)))
@@ -1435,6 +1636,28 @@ def detection_suffix(label: str) -> str:
     if "_" not in label:
         return ""
     return label.split("_", 1)[1]
+
+
+# Marker in a battery class name meaning "this battery type has no Bunsen
+# valves". Matched as a whole underscore-delimited token, so battery_sealed,
+# battery_sealed_agm and battery_agm_sealed all qualify while a name that merely
+# contains the letters (e.g. battery_unsealed) does not.
+SEALED_BATTERY_TOKEN = "sealed"
+
+
+def is_sealed_battery(label: str) -> bool:
+    """True when a battery class is marked as needing no Bunsen valves.
+
+    Keying off the class name means one rule covers every sealed battery type,
+    and a new sealed product only has to be named consistently -- no per-type
+    setup in BungVision. An unmarked/unknown battery always gets the normal
+    valve check, so the failure direction is a nuisance stop, never a battery
+    reaching the wash unchecked.
+    """
+    label = str(label or "").strip().lower()
+    if detection_kind(label) != "battery":
+        return False
+    return SEALED_BATTERY_TOKEN in label.split("_")
 
 
 
@@ -1801,7 +2024,7 @@ class CameraWidget(QWidget):
                         p2.drawRoundedRect(QRect(rx1, ry1, rx2 - rx1, ry2 - ry1), 10, 10)
                     id_text = f"ID {grade.track_id}" if grade.track_id > 0 else "CAND"
                     line1 = f"{id_text}  {grade.status}"
-                    line2 = f"{grade.bung_count}/{grade.expected_bungs}"
+                    line2 = "SEALED" if getattr(grade, "valve_check_skipped", False) else f"{grade.bung_count}/{grade.expected_bungs}"
 
                     bx1 = min([p0 for p0, _ in grade_pts], default=rx1)
                     by1 = min([p1 for _, p1 in grade_pts], default=ry1)
@@ -1932,11 +2155,49 @@ class CameraWidget(QWidget):
             p.end()
 
 class Pill(QLabel):
-    def __init__(self, text: str, tone: str = "neutral"):
+    def __init__(self, text: str, tone: str = "neutral", compact: bool = False):
         super().__init__(text)
         self.setAlignment(Qt.AlignCenter)
-        self.setMinimumHeight(28)
+        self.compact = bool(compact)
+        if self.compact:
+            # Machine-interface pills: small status indicators, not headline
+            # elements. The font is set on the widget (not only in the
+            # stylesheet) so fontMetrics() stays accurate for pane sizing.
+            f = self.font()
+            f.setPixelSize(10)
+            f.setBold(True)
+            self.setFont(f)
+            self.setMinimumHeight(19)
+        else:
+            self.setMinimumHeight(28)
+        self._full_text = str(text)
         self.set_tone(tone)
+
+    # Compact (machine-interface) status text — camera mode, PLC errors — can be
+    # long and variable. Elide it to the pill's width and keep the full string in
+    # the tooltip so a long message can never widen or clip the fixed-width
+    # control column. Header chips size to their own text and are left alone.
+    def setText(self, text):
+        self._full_text = str(text)
+        if not getattr(self, "compact", False):
+            super().setText(self._full_text)
+            return
+        self.setToolTip(self._full_text)
+        super().setText(self._elided_text(self._full_text))
+
+    def _elided_text(self, text: str) -> str:
+        avail = self.width() - 16
+        if avail <= 24:
+            return text
+        return self.fontMetrics().elidedText(str(text), Qt.ElideRight, avail)
+
+    def resizeEvent(self, event):
+        super().resizeEvent(event)
+        if not getattr(self, "compact", False):
+            return
+        full = getattr(self, "_full_text", None)
+        if full:
+            QLabel.setText(self, self._elided_text(full))
 
     def set_tone(self, tone: str):
         colors = {
@@ -1947,7 +2208,43 @@ class Pill(QLabel):
             "neutral": ("#1e293b", "#cbd5e1", "#475569"),
         }
         bg, fg, border = colors.get(tone, colors["neutral"])
-        self.setStyleSheet(f"QLabel {{ background:{bg}; color:{fg}; border:1px solid {border}; border-radius:14px; padding:4px 10px; font-weight:700; }}")
+        if self.compact:
+            self.setStyleSheet(f"QLabel {{ background:{bg}; color:{fg}; border:1px solid {border}; border-radius:9px; padding:1px 6px; }}")
+        else:
+            self.setStyleSheet(f"QLabel {{ background:{bg}; color:{fg}; border:1px solid {border}; border-radius:14px; padding:4px 10px; font-weight:700; }}")
+
+
+class CompactStat(QFrame):
+    """One-line stat strip.
+
+    Same set_value(value, sub) API as MetricCard, but laid out horizontally so a
+    secondary readout (inference FPS / latency) costs one row instead of a full
+    card's worth of vertical space.
+    """
+
+    def __init__(self, title: str, value: str, sub: str = "", tone: str = "info"):
+        super().__init__()
+        self.setObjectName("CompactStat")
+        self.title = QLabel(title)
+        self.value = QLabel(value)
+        self.sub = QLabel(sub)
+        self.title.setStyleSheet("color:#94a3b8; font-size:10px; font-weight:800; letter-spacing:1px; background:transparent; border:none;")
+        self.value.setStyleSheet("color:white; font-size:13px; font-weight:900; background:transparent; border:none;")
+        self.sub.setStyleSheet("color:#64748b; font-size:11px; background:transparent; border:none;")
+        lay = QHBoxLayout(self)
+        lay.setContentsMargins(10, 2, 10, 2)
+        lay.setSpacing(7)
+        lay.addWidget(self.title)
+        lay.addStretch(1)
+        lay.addWidget(self.value)
+        lay.addWidget(self.sub)
+        border = {"pass": "#10b981", "fail": "#ef4444", "warn": "#f59e0b", "info": "#38bdf8", "neutral": "#334155"}.get(tone, "#334155")
+        self.setStyleSheet(f"QFrame#CompactStat {{ background:#0f172a; border:1px solid {border}; border-radius:12px; }}")
+
+    def set_value(self, value: str, sub: str = ""):
+        self.value.setText(value)
+        if sub:
+            self.sub.setText(sub)
 
 class MetricCard(QFrame):
     def __init__(self, title: str, value: str, sub: str = "", tone: str = "neutral"):
@@ -3028,8 +3325,8 @@ class SettingsDialog(QDialog):
         self._add_grid_row(igrid, 3, 0, "Locked IoU %", self.committed_track_iou_spin_local, "Overlap required to keep a committed PASS/FAIL locked while visible.")
         igrid.addWidget(self._check_item(self.require_full_view_local, "Hold a partial infeed/edge battery in WAIT instead of grading it FAIL before the full lid is visible."), 3, 2, 1, 2)
         self._add_grid_row(igrid, 4, 0, "Full View Margin %", self.full_view_margin_spin_local, "Battery must be this far from the frame edge before PASS/FAIL grading can commit.")
-        igrid.addWidget(self._check_item(self.pattern_validation_local, "Require the 6 assigned Bunsen valves to form either a clean 6-in-row pattern or a 2x3 pattern before PASS can commit."), 4, 2, 1, 2)
-        self._add_grid_row(igrid, 5, 0, "Pattern Tol %", self.pattern_tolerance_spin_local, "Geometry tolerance for row straightness, spacing consistency, and 2x3 alignment.")
+        igrid.addWidget(self._check_item(self.pattern_validation_local, "Auto-detect the single-row or 2x3 layout and count only Bunsen valves that sit on it. Off-pattern detections (terminals, mounting holes, strays) are ignored so they cannot inflate the count. Row spacing is not constrained."), 4, 2, 1, 2)
+        self._add_grid_row(igrid, 5, 0, "Pattern Tol %", self.pattern_tolerance_spin_local, "How far off the fitted row/grid a valve may sit and still be counted. Higher = looser (more forgiving of skew, but off-pattern items are more likely to count).")
         igrid.setRowStretch(6, 1)
 
         capture = QWidget()
@@ -3315,6 +3612,21 @@ class SettingsDialog(QDialog):
             for key, edit in self.plc_tag_local.items():
                 if key in p.plc_tag_edits:
                     p.plc_tag_edits[key].setText(edit.text().strip())
+        # Each PLC role needs its own tag. Sharing one makes a steady output
+        # (e.g. Bypass or Ready) take on whatever is written to that tag last,
+        # which is usually the toggling heartbeat.
+        conflicts = find_duplicate_plc_tags({k: e.text().strip() for k, e in self.plc_tag_local.items()})
+        if conflicts:
+            QMessageBox.warning(
+                self, "PLC Tag Conflict",
+                "These PLC roles are pointing at the same controller tag:\n\n  "
+                + "\n  ".join(conflicts)
+                + "\n\nEach role must have its own tag. While they overlap, the "
+                  "last value written wins, so an output such as Bypass or Ready "
+                  "will follow another signal (usually the heartbeat) instead of "
+                  "its own value.\n\nBypass suppresses the vision stop request, so "
+                  "please correct this before running production.",
+            )
 
         new_camera_settings = (
             str(getattr(p, "camera_backend", "opencv")),
@@ -4072,27 +4384,29 @@ class MainWindow(QMainWindow):
         side.setSpacing(5)
         side_widget.setStyleSheet(
             "QPushButton { background:#2563eb; color:white; border:none;"
-            " padding:4px 6px; border-radius:9px; font-size:12px; font-weight:800; }"
+            " padding:3px 6px; border-radius:8px; }"
             "QPushButton:hover { background:#3b82f6; }"
             "QPushButton:pressed { background:#1d4ed8; }"
             "QGroupBox { margin-top:9px; padding:3px; font-size:12px; }"
             "QGroupBox::title { subcontrol-origin:margin; subcontrol-position:top left;"
             " left:10px; padding:0 4px; }"
             "QCheckBox { font-size:11px; spacing:4px; }"
-            "QComboBox, QLineEdit, QSpinBox { padding:2px 5px; }"
+            "QComboBox, QLineEdit, QSpinBox { padding:2px 5px; font-size:11px; }"
         )
         metric_grid = QGridLayout()
         metric_grid.setSpacing(5)
         self.pass_rate_card = MetricCard("PASS RATE", "--", "no inspections", "neutral")
         self.reject_card = MetricCard("REJECTS", "0", "current session", "fail")
-        self.infer_card = MetricCard("INFERENCE", "-- FPS", "-- ms", "info")
+        # Inference is a diagnostic readout, not a headline number: keep it to a
+        # single strip instead of a full-width card.
+        self.infer_card = CompactStat("INFERENCE", "-- FPS", "-- ms", "info")
         # v0.9.77: keep the operator screen clean. Preview/camera/paint/skip
         # performance diagnostics remain in the debug PROFILE log, but the visible
         # HMI only shows inference FPS and inference timing.
         metric_grid.addWidget(self.pass_rate_card, 0, 0)
         metric_grid.addWidget(self.reject_card, 0, 1)
-        metric_grid.addWidget(self.infer_card, 1, 0, 1, 2)
         side.addLayout(metric_grid)
+        side.addWidget(self.infer_card)
 
         # Runtime controls exist as widgets but live in the Settings popup, not on the main operator screen.
         self.source_edit = QLineEdit("0")
@@ -4195,19 +4509,37 @@ class MainWindow(QMainWindow):
         self.preview_size_combo.setToolTip("Set the camera preview width as a fraction of the window width.")
         self.preview_size_combo.currentTextChanged.connect(self._apply_preview_size)
 
-        cg.addWidget(self.open_btn, 0, 0)
-        cg.addWidget(self.close_btn, 0, 1)
-        cg.addWidget(self.load_btn, 1, 0)
-        cg.addWidget(self.settings_btn, 1, 1)
-        cg.addWidget(self.reset_reject_btn, 2, 0)
-        cg.addWidget(self.reset_btn, 2, 1)
-        cg.addWidget(self.summary_btn, 3, 0, 1, 2)
+        # Vertical button stack. Buttons are sized to fit the longest label
+        # instead of being stretched across the pane, so they read as controls
+        # rather than banners.
+        stack = [
+            self.open_btn, self.close_btn, self.load_btn, self.settings_btn,
+            self.reset_reject_btn, self.reset_btn, self.summary_btn,
+        ]
+        btn_font = self.font()
+        btn_font.setPixelSize(12)
+        btn_font.setBold(True)
+        btn_w = 0
+        for b in stack:
+            b.setFont(btn_font)
+            btn_w = max(btn_w, b.fontMetrics().horizontalAdvance(b.text()))
+        btn_w = max(150, btn_w + 30)
+        for row, b in enumerate(stack):
+            b.setFixedSize(btn_w, 27)
+            cg.addWidget(b, row, 0, Qt.AlignHCenter)
         # Reject Classes now lives in the Settings dialog (Display tab); the button
         # object is kept for internal references but is not shown on the operator screen.
         self.reject_classes_btn.hide()
-        cg.addWidget(self.bypass_check, 4, 0, 1, 2)
-        cg.addWidget(preview_size_label, 5, 0)
-        cg.addWidget(self.preview_size_combo, 5, 1)
+        cg.addWidget(self.bypass_check, len(stack), 0, Qt.AlignHCenter)
+        preview_row = QWidget()
+        prow = QHBoxLayout(preview_row)
+        prow.setContentsMargins(0, 0, 0, 0)
+        prow.setSpacing(6)
+        preview_size_label.setStyleSheet("font-size:11px;")
+        self.preview_size_combo.setFixedWidth(74)
+        prow.addWidget(preview_size_label)
+        prow.addWidget(self.preview_size_combo)
+        cg.addWidget(preview_row, len(stack) + 1, 0, Qt.AlignHCenter)
         side.addWidget(controls)
 
         # Camera Overlay and Image Saving controls have moved to the Settings
@@ -4263,13 +4595,15 @@ class MainWindow(QMainWindow):
         plc = QGroupBox("Machine Interface")
         pg = QGridLayout(plc)
         pg.setContentsMargins(6, 8, 6, 6)
-        pg.setSpacing(4)
-        self.heartbeat_pill = Pill("Heartbeat SIM", "warn")
-        self.stop_output_pill = Pill("Stop Output OFF", "neutral")
-        self.alarm_pill = Pill("Alarm OFF", "neutral")
-        self.ready_pill = Pill("Not Ready", "warn")
-        self.camera_actual_pill = Pill("Actual Camera --", "neutral")
-        self.plc_write_pill = Pill("PLC Writes OFF", "neutral")
+        pg.setSpacing(3)
+        # Compact pills: these are at-a-glance status indicators, so they are
+        # deliberately smaller than the headline chips in the window header.
+        self.heartbeat_pill = Pill("Heartbeat SIM", "warn", compact=True)
+        self.stop_output_pill = Pill("Stop Output OFF", "neutral", compact=True)
+        self.alarm_pill = Pill("Alarm OFF", "neutral", compact=True)
+        self.ready_pill = Pill("Not Ready", "warn", compact=True)
+        self.camera_actual_pill = Pill("Actual Camera --", "neutral", compact=True)
+        self.plc_write_pill = Pill("PLC Writes OFF", "neutral", compact=True)
         pg.addWidget(self.heartbeat_pill, 0, 0)
         pg.addWidget(self.stop_output_pill, 0, 1)
         pg.addWidget(self.alarm_pill, 1, 0)
@@ -4601,30 +4935,19 @@ class MainWindow(QMainWindow):
             cam.setMaximumWidth(max(cam.minimumWidth(), int(avail * frac)))
 
     def _lock_side_pane_width(self):
-        """Lock the control column to a fixed width sized for its worst case.
+        """Lock the control column to a fixed width sized for its fixed content.
 
-        The widest elements are the full-span Machine-Interface pills, whose
-        text is dynamic. Compute the pixel width of their worst-case strings via
-        the pill's own font metrics (deterministic and font-accurate on the
-        target system), add the pill/group/layout chrome, and lock the pane to
-        that. Because the width is fixed, runtime text can never move the pane.
+        Width follows what the static content actually needs (button stack,
+        metric cards, group chrome) on the target system's font metrics. Long
+        dynamic status text is deliberately excluded: those pills elide to the
+        pane width and keep the full string in their tooltip, so runtime text can
+        never widen, clip, or shift the column.
         """
         sw = getattr(self, "_side_content", None)
         if sw is None:
             return
-        # Worst-case full-span pill strings (camera detail line; PLC write error).
-        worst_texts = [
-            "Actual 2592x1944 @ 30  ROI 2592x1944+9999+9999",
-            "PLC Writes WRITE ERROR: TAG ERROR: reset_req...",
-        ]
-        pill = getattr(self, "plc_write_pill", None)
-        fm = pill.fontMetrics() if pill is not None else self.fontMetrics()
-        text_w = max(fm.horizontalAdvance(t) for t in worst_texts)
-        # Chrome around a full-span pill: pill padding (2*10) + border (2) +
-        # Machine-Interface group padding/border + side/group margins. Use a
-        # comfortable allowance so the text never touches the edges.
-        chrome = 56
-        width = max(300, text_w + chrome)
+        hint = int(sw.sizeHint().width())
+        width = max(260, min(360, hint + 12))
         sw.setFixedWidth(width)
 
     def resizeEvent(self, event):
@@ -6382,28 +6705,70 @@ class MainWindow(QMainWindow):
                 )
 
             pattern_info = {"ok": None, "pattern": "", "reason": "", "score": 0.0}
+            pattern_note = ""
+            # Sealed battery types carry no Bunsen valves, so there is nothing to
+            # count. Skip the check entirely rather than expecting zero, so a
+            # stray detection on a sealed lid cannot stop the line. The battery is
+            # still tracked, committed and counted like any other part.
+            sealed = is_sealed_battery(batt.label)
+            if sealed:
+                # "Sealed battery" already names the type; only add the suffix when
+                # it carries extra information (e.g. battery_sealed_agm).
+                sealed_note = "" if batt_suffix == SEALED_BATTERY_TOKEN else f" [{batt_suffix}]"
+                if not full_view_ok:
+                    status = "WAIT"
+                    reason = f"Waiting for full battery view / infeed gate: sealed battery{sealed_note}"
+                else:
+                    status = "PASS"
+                    reason = f"Sealed battery - no Bunsen valve check{sealed_note}"
+                grades.append(
+                    BatteryGrade(
+                        track_id=-1,
+                        box=batt.box,
+                        confidence=batt.conf,
+                        bung_count=0,
+                        expected_bungs=0,
+                        bung_boxes=[],
+                        status=status,
+                        reason=reason,
+                        obb_points=batt.obb_points,
+                        assigned_bung_indices=[],
+                        pattern_name="",
+                        pattern_ok=None,
+                        pattern_reason="",
+                        valve_check_skipped=True,
+                    )
+                )
+                continue
+
+            # When pattern validation is on, count only the valves that sit on the
+            # auto-detected row/grid. Off-pattern detections (terminals, rail
+            # holes, strays) are dropped so they cannot inflate the count.
+            if bool(getattr(self, "enable_pattern_validation", True)) and int(expected) == 6 and len(assigned_indices) > 0:
+                tol = float(getattr(self, "pattern_tolerance_percent", 25.0)) / 100.0
+                local_points = [normalized_point_in_detection(batt, detection_center(bungs[i])) for i in assigned_indices]
+                fit = fit_bung_pattern(local_points, expected=int(expected), tol=tol)
+                keep = fit.get("inliers") or list(range(len(assigned_indices)))
+                dropped = len(assigned_indices) - len(keep)
+                assigned_indices = [assigned_indices[k] for k in keep]
+                inside = [bungs[i].box for i in assigned_indices]
+                count = len(assigned_indices)
+                pattern_info = {"ok": count == int(expected), "pattern": fit.get("pattern", ""),
+                                "reason": fit.get("reason", ""), "score": 0.0}
+                if fit.get("pattern"):
+                    pattern_note = f", pattern {fit.get('pattern')}"
+                if dropped:
+                    pattern_note += f" ({dropped} off-pattern ignored)"
+
             if not full_view_ok:
                 status = "WAIT"
                 reason = f"Waiting for full battery view / infeed gate: {count}/{expected} Bunsen valves{model_note}{ownership_note}"
             elif count == expected:
-                if bool(getattr(self, "enable_pattern_validation", True)) and int(expected) == 6:
-                    local_points = [normalized_point_in_detection(batt, detection_center(bungs[i])) for i in assigned_indices]
-                    pattern_info = validate_six_bung_pattern(
-                        local_points,
-                        tolerance_percent=float(getattr(self, "pattern_tolerance_percent", 25.0)),
-                    )
-                    if pattern_info.get("ok"):
-                        status = "PASS"
-                        reason = f"{count}/{expected} Bunsen valves, pattern {pattern_info.get('pattern')}{model_note}{ownership_note}"
-                    else:
-                        status = "FAIL"
-                        reason = f"{count}/{expected} Bunsen valves, {pattern_info.get('reason', 'pattern invalid')}{model_note}{ownership_note}"
-                else:
-                    status = "PASS"
-                    reason = f"{count}/{expected} Bunsen valves{model_note}{ownership_note}"
+                status = "PASS"
+                reason = f"{count}/{expected} Bunsen valves{pattern_note}{model_note}{ownership_note}"
             else:
                 status = "FAIL"
-                reason = f"{count}/{expected} Bunsen valves{model_note}{ownership_note}"
+                reason = f"{count}/{expected} Bunsen valves{pattern_note}{model_note}{ownership_note}"
 
             grades.append(
                 BatteryGrade(
@@ -6444,7 +6809,14 @@ class MainWindow(QMainWindow):
             reason = f"All {len(grades)} visible batteries passed"
             total_bungs = sum(g.bung_count for g in grades)
 
-        return InspectionResult(status, reason, len(batteries), total_bungs, expected, detections, self.fps, grades)
+        # Frame-level target: when every visible battery is a sealed type there is
+        # nothing to count, so report 0 expected. The decision panel renders that
+        # as "--" instead of a misleading 0/6.
+        frame_expected = expected
+        if grades and all(getattr(g, "valve_check_skipped", False) for g in grades):
+            frame_expected = 0
+
+        return InspectionResult(status, reason, len(batteries), total_bungs, frame_expected, detections, self.fps, grades)
 
     def _record_preview_submit(self, display_seq: int = 0) -> None:
         """Record actual frames submitted to the preview widget.
@@ -6719,7 +7091,11 @@ class MainWindow(QMainWindow):
         else:
             self.decision_label.setText(result.status)
             self.reason_label.setText(result.reason)
-        self.bung_big.setText(f"{result.bung_count}/{result.expected_bungs}")
+        # Sealed batteries have no valve target, so show "--" rather than 0/6.
+        if int(getattr(result, "expected_bungs", 0)) <= 0:
+            self.bung_big.setText("--")
+        else:
+            self.bung_big.setText(f"{result.bung_count}/{result.expected_bungs}")
         if getattr(self, "reject_latched", False):
             self.decision_frame.setStyleSheet("QFrame#DecisionFrame { background:#7f1d1d; border:2px solid #f97316; border-radius:22px; }")
         elif result.status == "PASS":
@@ -7068,7 +7444,7 @@ class MainWindow(QMainWindow):
                 lx, ly = x1, y2
             id_text = f"ID {grade.track_id}" if grade.track_id > 0 else "CAND"
             line1 = f"{id_text} {grade.status}"
-            line2 = f"{grade.bung_count}/{grade.expected_bungs}"
+            line2 = "SEALED" if getattr(grade, "valve_check_skipped", False) else f"{grade.bung_count}/{grade.expected_bungs}"
 
             if getattr(grade, "obb_points", None):
                 gx1 = int(min(p[0] for p in grade.obb_points))
@@ -7376,6 +7752,25 @@ def main():
     apply_global_readability_style()
     sys.argv = _argv_string_list(sys.argv)
     _write_debug_log(f"main() post-QApplication argv={sys.argv!r}")
+
+    # Refuse to start a second copy: two instances write the same PLC tags at
+    # about 10 Hz and their outputs fight, which can flicker Bypass (and Bypass
+    # suppresses the vision stop request).
+    acquired, other = acquire_single_instance_lock()
+    if not acquired:
+        _write_debug_log(f"SECOND_INSTANCE_REFUSED existing={other!r}")
+        QMessageBox.critical(
+            None, "BungVision Is Already Running",
+            "Another copy of BungVision is already running on this machine"
+            + (f"\n\nRunning copy: {other}" if other else "")
+            + "\n\nTwo copies write the same PLC tags at the same time, so the "
+              "machine sees the outputs flicker between them — including Bypass, "
+              "which suppresses the vision stop request.\n\n"
+              "Switch to the copy that is already running. If it is not on screen, "
+              "close it from the task bar (or reboot the panel) and start again.",
+        )
+        sys.exit(1)
+
     w = MainWindow()
     # On small operator panels (e.g. XGA 1024x768) maximize so the entire HMI
     # is reachable within the screen instead of opening partly off-screen.
