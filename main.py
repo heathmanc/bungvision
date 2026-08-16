@@ -45,15 +45,19 @@ from PySide6.QtWidgets import (
 
 from camera_backend import BaslerPylonCamera, create_camera_backend, list_basler_cameras
 
-APP_TITLE = "BungVision Python Line-Side HMI v0.9.112 Sealed Battery Support"
+APP_TITLE = "BungVision Python Line-Side HMI v0.9.113 Manual Capture Mode"
 ROOT = Path(__file__).resolve().parent
 LOG_DIR = ROOT / "logs"
 FAIL_DIR = ROOT / "fail_snapshots"
 PASS_DIR = ROOT / "pass_snapshots"
 TRAINING_REVIEW_DIR = ROOT / "training_review_captures"
+# Operator-triggered raw frames for model training (blank conveyor, hand-placed
+# parts, hard negatives). Kept separate from the runtime PASS/FAIL snapshots so a
+# training set is never mixed in with production evidence.
+MANUAL_CAPTURE_DIR = ROOT / "manual_captures"
 CONFIG_DIR = ROOT / "config"
 SETTINGS_FILE = CONFIG_DIR / "settings.json"
-for d in (LOG_DIR, FAIL_DIR, PASS_DIR, TRAINING_REVIEW_DIR, CONFIG_DIR):
+for d in (LOG_DIR, FAIL_DIR, PASS_DIR, TRAINING_REVIEW_DIR, MANUAL_CAPTURE_DIR, CONFIG_DIR):
     d.mkdir(parents=True, exist_ok=True)
 
 DEBUG_LOG_FILE = LOG_DIR / "bungvision_debug.log"
@@ -3353,6 +3357,27 @@ class SettingsDialog(QDialog):
         open_fail = QPushButton("Open Fail"); open_fail.clicked.connect(lambda: self.parent_hmi.open_folder(TRAINING_REVIEW_DIR / "fail"))
         open_pass = QPushButton("Open Pass"); open_pass.clicked.connect(lambda: self.parent_hmi.open_folder(TRAINING_REVIEW_DIR / "pass"))
         cgrid.addWidget(open_all, 3, 0); cgrid.addWidget(open_fail, 3, 1); cgrid.addWidget(open_pass, 3, 2)
+
+        # Manual capture mode: camera live, inference paused, raw frames saved on
+        # demand. For blank-conveyor and hand-placed training data.
+        self.capture_mode_local = QCheckBox("Manual capture mode (inference OFF)")
+        self.capture_interval_local = self._spin(0, 0, 600, 1)
+        cgrid.addWidget(self._check_item(
+            self.capture_mode_local,
+            "Keep the camera live but pause inference, and show a Capture Frame button "
+            "on the main screen (shortcut: Space). Raw unannotated frames are saved to "
+            "manual_captures/ for training. Nothing is graded and PLC Ready stays off "
+            "while this is on."), 4, 0, 1, 2)
+        interval_row = QWidget(); irow = QHBoxLayout(interval_row)
+        irow.setContentsMargins(0, 0, 0, 0); irow.setSpacing(5)
+        irow.addWidget(self._setting_label(
+            "Auto every N sec", "0 = manual only. Above 0, capture a frame automatically on that interval (useful for blank-conveyor footage)."))
+        irow.addWidget(self.capture_interval_local); irow.addStretch()
+        cgrid.addWidget(interval_row, 5, 0, 1, 2)
+        open_manual = QPushButton("Open Manual Captures")
+        open_manual.clicked.connect(lambda: self.parent_hmi.open_folder(MANUAL_CAPTURE_DIR))
+        cgrid.addWidget(open_manual, 5, 2)
+
         note = QLabel("Review/correct saved examples in the labeling tool before retraining.")
         note.setStyleSheet("color:#94a3b8; background:transparent; padding-top:4px;")
         cgrid.addWidget(note, 4, 0, 1, 3)
@@ -3504,6 +3529,8 @@ class SettingsDialog(QDialog):
 
         self.save_pass_images_local.setChecked(bool(getattr(p, "save_pass_training_images", True)))
         self.save_fail_images_local.setChecked(bool(getattr(p, "save_fail_training_images", True)))
+        self.capture_mode_local.setChecked(bool(getattr(p, "capture_mode", False)))
+        self.capture_interval_local.setValue(int(float(getattr(p, "manual_capture_interval_s", 0.0))))
 
         # Display tab: mirror the (now hidden) side-pane overlay / snapshot checkboxes.
         self.overlay_enable_local.setChecked(p._checkbox_checked("overlay_enable_check", True))
@@ -3583,6 +3610,9 @@ class SettingsDialog(QDialog):
 
         p.save_pass_training_images = self.save_pass_images_local.isChecked()
         p.save_fail_training_images = self.save_fail_images_local.isChecked()
+        p.manual_capture_interval_s = float(self.capture_interval_local.value())
+        # Route through set_capture_mode so inference is actually paused/resumed.
+        p.set_capture_mode(self.capture_mode_local.isChecked())
 
         # Display tab: push overlay / snapshot toggles back onto the hidden
         # side-pane checkboxes so their existing change handlers run and apply.
@@ -4116,6 +4146,15 @@ class MainWindow(QMainWindow):
             self.resize(default_w, default_h)
             self._small_screen = False
         self.cap: Optional[Any] = None
+        # Manual capture mode: camera live, inference paused, operator saves raw
+        # frames for training. Not an inspection state -- PLC Ready stays false.
+        # Deliberately never restored from settings, so the app cannot start with
+        # inference silently off.
+        self.capture_mode = False
+        self.manual_capture_interval_s = 0.0
+        self._manual_capture_count = 0
+        self._last_auto_capture_t = 0.0
+        self._last_camera_frame = None
         self.camera_backend = "opencv"
         self.opencv_api = "auto"
         self.basler_serial = ""
@@ -4509,12 +4548,22 @@ class MainWindow(QMainWindow):
         self.preview_size_combo.setToolTip("Set the camera preview width as a fraction of the window width.")
         self.preview_size_combo.currentTextChanged.connect(self._apply_preview_size)
 
+        # Only shown while capture mode is active (Settings -> Capture).
+        self.capture_frame_btn = QPushButton("Capture Frame")
+        self.capture_frame_btn.setToolTip(
+            "Save the current raw camera frame to manual_captures/ for training.\n"
+            "Shortcut: Space. Only available in capture mode."
+        )
+        self.capture_frame_btn.clicked.connect(lambda _checked=False: self.capture_manual_frame())
+        self.capture_frame_btn.setVisible(False)
+
         # Vertical button stack. Buttons are sized to fit the longest label
         # instead of being stretched across the pane, so they read as controls
         # rather than banners.
         stack = [
             self.open_btn, self.close_btn, self.load_btn, self.settings_btn,
             self.reset_reject_btn, self.reset_btn, self.summary_btn,
+            self.capture_frame_btn,
         ]
         btn_font = self.font()
         btn_font.setPixelSize(12)
@@ -4653,6 +4702,12 @@ class MainWindow(QMainWindow):
         self._esc_stop_shortcut.activated.connect(lambda: self.request_operator_stop("esc") if bool(getattr(self, "running", False)) else None)
         self._f12_stop_shortcut = QShortcut(QKeySequence("F12"), self)
         self._f12_stop_shortcut.activated.connect(lambda: self.request_operator_stop("f12") if bool(getattr(self, "running", False)) else None)
+        # Space grabs a training frame, but only in capture mode so it can never
+        # fire during production.
+        self._capture_shortcut = QShortcut(QKeySequence(Qt.Key_Space), self)
+        self._capture_shortcut.activated.connect(
+            lambda: self.capture_manual_frame() if bool(getattr(self, "capture_mode", False)) else None
+        )
 
     def apply_theme(self):
         # App-level rules are needed for QMessageBox/QFileDialog because they are
@@ -4692,6 +4747,9 @@ class MainWindow(QMainWindow):
         return {
             "save_pass_training_images": self._bool_attr("save_pass_training_images", True),
             "save_fail_training_images": self._bool_attr("save_fail_training_images", True),
+            # Capture mode itself is deliberately not persisted: the app must
+            # never restart with inference silently off.
+            "manual_capture_interval_s": float(getattr(self, "manual_capture_interval_s", 0.0)),
             "save_training_annotated": self._bool_attr("save_training_annotated", True),
             "save_training_json": self._bool_attr("save_training_json", True),
             "save_training_yolo_txt": self._bool_attr("save_training_yolo_txt", False),
@@ -4835,6 +4893,7 @@ class MainWindow(QMainWindow):
 
             self.save_pass_training_images = bool(data.get("save_pass_training_images", getattr(self, "save_pass_training_images", True)))
             self.save_fail_training_images = bool(data.get("save_fail_training_images", getattr(self, "save_fail_training_images", True)))
+            self.manual_capture_interval_s = max(0.0, min(600.0, float(data.get("manual_capture_interval_s", getattr(self, "manual_capture_interval_s", 0.0)))))
             self.save_training_annotated = bool(data.get("save_training_annotated", getattr(self, "save_training_annotated", True)))
             self.save_training_json = bool(data.get("save_training_json", getattr(self, "save_training_json", True)))
             self.save_training_yolo_txt = bool(data.get("save_training_yolo_txt", getattr(self, "save_training_yolo_txt", False)))
@@ -5075,8 +5134,95 @@ class MainWindow(QMainWindow):
             self._plc_heartbeat = heartbeat
         return bool(getattr(self, "_plc_heartbeat", False))
 
+    def set_capture_mode(self, on: bool) -> None:
+        """Turn manual capture mode on/off.
+
+        Capture mode keeps the camera live but pauses inference, so the operator
+        can record raw frames for training (blank conveyor, hand-placed parts)
+        without the model grading them or the PLC being told anything is being
+        inspected. It is a maintenance mode, not an inspection state: PLC Ready
+        is forced false while it is active.
+        """
+        on = bool(on)
+        if on == bool(getattr(self, "capture_mode", False)):
+            return
+        self.capture_mode = on
+        worker = getattr(self, "inference_worker", None)
+        if worker is not None:
+            if on:
+                # Detach the frame source: the worker idles, so no GPU load and
+                # no results arrive to grade.
+                worker.set_frame_source(None)
+                worker.clear()
+            elif getattr(self, "camera_worker", None) is not None:
+                worker.clear()
+                worker.set_frame_source(self.camera_worker.get_latest)
+        if on:
+            self._manual_capture_count = 0
+            self._last_auto_capture_t = 0.0
+            self.last_result = None
+            self._last_result_seq = 0
+        if hasattr(self, "capture_frame_btn"):
+            self.capture_frame_btn.setVisible(on)
+        if hasattr(self, "bung_big"):
+            # Nothing is being graded, so do not show a valve target.
+            self.bung_big.setText("--" if on else f"0/{self._spin_value('expected_spin', 6)}")
+        if hasattr(self, "decision_label"):
+            if on:
+                self.decision_label.setText("CAPTURE MODE")
+                self.reason_label.setText("Inference paused. Saving to manual_captures/.")
+                self.decision_frame.setStyleSheet(
+                    "QFrame#DecisionFrame { background:#1e3a8a; border:2px solid #60a5fa; border-radius:22px; }"
+                )
+            else:
+                self.decision_label.setText("READY")
+                self.reason_label.setText("Capture mode off. Inference resumed.")
+                self.decision_frame.setStyleSheet(
+                    "QFrame#DecisionFrame { background:#1e293b; border:1px solid #334155; border-radius:22px; }"
+                )
+        self.update_plc_outputs(None)
+        self.update_status_pills(None)
+        self.log(f"CAPTURE MODE {'ON - inference paused' if on else 'OFF - inference resumed'}")
+
+    def capture_manual_frame(self, auto: bool = False) -> bool:
+        """Save the current raw camera frame to manual_captures/.
+
+        Saves the unannotated full-resolution frame: overlays would be baked into
+        a training image. Disk work is handed to the save worker so the preview
+        never stalls.
+        """
+        if not bool(getattr(self, "capture_mode", False)):
+            return False
+        frame = getattr(self, "_last_camera_frame", None)
+        if frame is None:
+            self.reason_label.setText("No camera frame to capture. Press Run first.")
+            return False
+        try:
+            stamp = dt.datetime.now().strftime("%Y%m%d_%H%M%S_%f")[:-3]
+            path = MANUAL_CAPTURE_DIR / f"manual_{stamp}.jpg"
+            snapshot = frame.copy()
+            worker = getattr(self, "save_worker", None)
+            if worker is not None:
+                worker.enqueue(cv2.imwrite, str(path), snapshot, [int(cv2.IMWRITE_JPEG_QUALITY), 95])
+            else:
+                cv2.imwrite(str(path), snapshot, [int(cv2.IMWRITE_JPEG_QUALITY), 95])
+            self._manual_capture_count = int(getattr(self, "_manual_capture_count", 0)) + 1
+            kind = "auto" if auto else "manual"
+            self.reason_label.setText(
+                f"Saved {path.name} ({self._manual_capture_count} this session, {kind})"
+            )
+            return True
+        except Exception as e:
+            self.reason_label.setText(f"Capture failed: {e}")
+            self.log(f"MANUAL_CAPTURE_ERROR {e}")
+            return False
+
     def vision_healthy(self) -> bool:
         """Fail-safe health gate for PLC Ready."""
+        # Capture mode is a maintenance state: nothing is being inspected, so the
+        # PLC must not see Ready.
+        if bool(getattr(self, "capture_mode", False)):
+            return False
         if bool(getattr(self, "demo_mode", False)):
             return bool(getattr(self, "running", False))
         if not bool(getattr(self, "running", False)):
@@ -5362,6 +5508,7 @@ class MainWindow(QMainWindow):
             self._next_inspection_id = 1
         self.last_logged_status = None
         self.last_frame = None
+        self._last_camera_frame = None
         self.last_preview_rgb = None
         self.last_result = None
         self._last_camera_seq_seen = 0
@@ -5513,7 +5660,10 @@ class MainWindow(QMainWindow):
         self.camera_worker.start()
         if hasattr(self, "inference_worker") and self.inference_worker is not None:
             self.inference_worker.clear()
-            self.inference_worker.set_frame_source(self.camera_worker.get_latest)
+            # In capture mode the worker stays detached so opening the camera does
+            # not silently resume inference.
+            if not bool(getattr(self, "capture_mode", False)):
+                self.inference_worker.set_frame_source(self.camera_worker.get_latest)
             self.inference_worker.start()
         if getattr(self, "preview_worker", None) is not None:
             self.preview_worker.clear()
@@ -6891,6 +7041,14 @@ class MainWindow(QMainWindow):
 
         if getattr(self, "camera_worker", None) is not None:
             latest_cam = self.camera_worker.get_latest()
+            # Keep the newest raw (unannotated) frame available for manual capture.
+            if latest_cam is not None and getattr(latest_cam, "frame", None) is not None:
+                self._last_camera_frame = latest_cam.frame
+                if bool(getattr(self, "capture_mode", False)):
+                    interval = float(getattr(self, "manual_capture_interval_s", 0.0) or 0.0)
+                    if interval > 0.0 and (now_loop - float(getattr(self, "_last_auto_capture_t", 0.0) or 0.0)) >= interval:
+                        self._last_auto_capture_t = now_loop
+                        self.capture_manual_frame(auto=True)
             cam_fps, cam_err, cam_seq = self.camera_worker.status()
             self.camera_capture_fps = cam_fps
             try:
