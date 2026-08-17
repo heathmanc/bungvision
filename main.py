@@ -45,7 +45,7 @@ from PySide6.QtWidgets import (
 
 from camera_backend import BaslerPylonCamera, create_camera_backend, list_basler_cameras
 
-APP_TITLE = "BungVision Python Line-Side HMI v0.9.113 Manual Capture Mode"
+APP_TITLE = "BungVision Python Line-Side HMI v0.9.114 Capture Tab Layout Fix"
 ROOT = Path(__file__).resolve().parent
 LOG_DIR = ROOT / "logs"
 FAIL_DIR = ROOT / "fail_snapshots"
@@ -3380,8 +3380,11 @@ class SettingsDialog(QDialog):
 
         note = QLabel("Review/correct saved examples in the labeling tool before retraining.")
         note.setStyleSheet("color:#94a3b8; background:transparent; padding-top:4px;")
-        cgrid.addWidget(note, 4, 0, 1, 3)
-        cgrid.setRowStretch(5, 1)
+        # Rows 4-5 hold the manual capture controls; keep this note below them.
+        # (It previously sat on row 4 and, being added last, painted over the
+        # capture-mode checkbox and swallowed its clicks.)
+        cgrid.addWidget(note, 6, 0, 1, 3)
+        cgrid.setRowStretch(7, 1)
 
         plc_tab = QWidget()
         pgrid = QGridLayout(plc_tab)
