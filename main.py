@@ -45,7 +45,7 @@ from PySide6.QtWidgets import (
 
 from camera_backend import BaslerPylonCamera, create_camera_backend, list_basler_cameras
 
-APP_TITLE = "BungVision Python Line-Side HMI v0.9.114 Capture Tab Layout Fix"
+APP_TITLE = "BungVision Python Line-Side HMI v0.9.115 Capture + Detect"
 ROOT = Path(__file__).resolve().parent
 LOG_DIR = ROOT / "logs"
 FAIL_DIR = ROOT / "fail_snapshots"
@@ -4551,6 +4551,16 @@ class MainWindow(QMainWindow):
         self.preview_size_combo.setToolTip("Set the camera preview width as a fraction of the window width.")
         self.preview_size_combo.currentTextChanged.connect(self._apply_preview_size)
 
+        # Always available: saves the inspected frame plus a labeler JSON of what
+        # the model found, for reviewing/correcting real detections.
+        self.capture_detect_btn = QPushButton("Capture + Detect")
+        self.capture_detect_btn.setToolTip(
+            "Save the current inspected frame to manual_captures/ along with a .json\n"
+            "of everything the model classified (no .json if nothing was found).\n"
+            "Inference keeps running — use this to collect real detections to correct."
+        )
+        self.capture_detect_btn.clicked.connect(lambda _checked=False: self.capture_manual_with_inference())
+
         # Only shown while capture mode is active (Settings -> Capture).
         self.capture_frame_btn = QPushButton("Capture Frame")
         self.capture_frame_btn.setToolTip(
@@ -4566,7 +4576,7 @@ class MainWindow(QMainWindow):
         stack = [
             self.open_btn, self.close_btn, self.load_btn, self.settings_btn,
             self.reset_reject_btn, self.reset_btn, self.summary_btn,
-            self.capture_frame_btn,
+            self.capture_detect_btn, self.capture_frame_btn,
         ]
         btn_font = self.font()
         btn_font.setPixelSize(12)
@@ -5214,6 +5224,126 @@ class MainWindow(QMainWindow):
             self.reason_label.setText(
                 f"Saved {path.name} ({self._manual_capture_count} this session, {kind})"
             )
+            return True
+        except Exception as e:
+            self.reason_label.setText(f"Capture failed: {e}")
+            self.log(f"MANUAL_CAPTURE_ERROR {e}")
+            return False
+
+    def _manual_capture_payload(self, result: "InspectionResult", raw_path: Path, w: int, h: int) -> dict:
+        """Labeler-compatible sidecar for a manual capture taken with inference.
+
+        Same boxes-first / clockwise-OBB shape the training-review captures use,
+        so these import into the label tool the same way. Frame-level rather than
+        per-battery: it carries every detection in the frame plus a short summary
+        of how each visible battery graded.
+        """
+        class_names = self._runtime_class_names()
+        detections = list(getattr(result, "detections", []) or [])
+        annotations = [self._label_tool_annotation(det, class_names, w, h, idx)
+                       for idx, det in enumerate(detections, start=1)]
+        annotations = self._add_label_tool_identifiers(annotations, raw_path.stem)
+        obb_shapes = [a for a in annotations if a.get("kind") == "obb" or a.get("type") == "obb"]
+        legacy_boxes = [a for a in annotations if a.get("kind") == "box" or a.get("type") == "box"]
+        grades = []
+        for g in list(getattr(result, "battery_grades", []) or []):
+            grades.append({
+                "battery_id": int(getattr(g, "track_id", -1)),
+                "status": getattr(g, "status", ""),
+                "reason": getattr(g, "reason", ""),
+                "expected_bungs": int(getattr(g, "expected_bungs", 0)),
+                "assigned_bung_count": int(getattr(g, "bung_count", 0)),
+                "valve_check_skipped": bool(getattr(g, "valve_check_skipped", False)),
+                "battery_obb": obb_geometry(getattr(g, "obb_points", None)),
+                "pattern": getattr(g, "pattern_name", ""),
+                "pattern_ok": getattr(g, "pattern_ok", None),
+            })
+        return {
+            "image": raw_path.name,
+            "identifier": raw_path.stem,
+            "image_identifier": raw_path.stem,
+            "capture_identifier": raw_path.stem,
+            "width": int(w),
+            "height": int(h),
+            "boxes": annotations,
+            "shapes": obb_shapes,
+            "obb_boxes": obb_shapes,
+            "annotations": annotations,
+            "objects": annotations,
+            "inspection_summary": {
+                "status": getattr(result, "status", ""),
+                "reason": getattr(result, "reason", ""),
+                "battery_count": int(getattr(result, "battery_count", 0)),
+                "bung_count": int(getattr(result, "bung_count", 0)),
+                "expected_bungs": int(getattr(result, "expected_bungs", 0)),
+                "batteries": grades,
+            },
+            "annotation_format": "bungvision_labeler_v0_14_boxes_first_obb_clockwise",
+            "label_tool_import": {
+                "preferred_source": "boxes",
+                "preferred_obb_source": "boxes",
+                "secondary_obb_source": "shapes",
+                "fallback_box_source": "boxes",
+                "obb_shape_type": "rotated_box",
+                "note": "OBB detections are included in boxes[] with kind/type=obb, non-empty identifier fields, and point order normalized to point 1 then clockwise for Bung Labeler import.",
+            },
+            "metadata": {
+                "timestamp": dt.datetime.now().isoformat(timespec="milliseconds"),
+                "source": "BungVision manual capture with inference",
+                "candidate_warning": "Review/correct these OBB/box candidates in the labeling tool before using them for training.",
+                "model_path": getattr(self.model_runner, "path", ""),
+                "model_task": getattr(self.model_runner, "task", "detect"),
+                "annotation_mode": "boxes_first_with_clockwise_obb_kind_and_points",
+                "class_names": class_names,
+                "detection_count": len(annotations),
+                "obb_count": len(obb_shapes),
+                "box_count": len(legacy_boxes),
+            },
+        }
+
+    def capture_manual_with_inference(self) -> bool:
+        """Save the current inspected frame to manual_captures/, with a JSON of
+        its detections when the model classified anything.
+
+        Uses the frame the newest result was produced from (not the newest camera
+        frame), so the saved boxes line up with the saved image.
+        """
+        if bool(getattr(self, "capture_mode", False)):
+            self.reason_label.setText("Capture mode is on, so nothing is being classified. Use Capture Frame, or turn capture mode off.")
+            return False
+        if getattr(self.model_runner, "model", None) is None:
+            self.reason_label.setText("No model loaded - nothing to classify. Press Load Model first.")
+            return False
+        frame = getattr(self, "last_frame", None)
+        result = getattr(self, "last_result", None)
+        if frame is None or result is None:
+            self.reason_label.setText("No inspected frame yet. Press Run and wait for a result.")
+            return False
+        try:
+            stamp = dt.datetime.now().strftime("%Y%m%d_%H%M%S_%f")[:-3]
+            raw_path = MANUAL_CAPTURE_DIR / f"manual_{stamp}.jpg"
+            snapshot = frame.copy()
+            h, w = snapshot.shape[:2]
+            detections = list(getattr(result, "detections", []) or [])
+            worker = getattr(self, "save_worker", None)
+            if worker is not None:
+                worker.enqueue(cv2.imwrite, str(raw_path), snapshot, [int(cv2.IMWRITE_JPEG_QUALITY), 95])
+            else:
+                cv2.imwrite(str(raw_path), snapshot, [int(cv2.IMWRITE_JPEG_QUALITY), 95])
+            wrote_json = False
+            if detections:
+                payload = self._manual_capture_payload(result, raw_path, w, h)
+                json_path = raw_path.with_suffix(".json")
+                text = json.dumps(payload, indent=2)
+                if worker is not None:
+                    worker.enqueue(json_path.write_text, text, encoding="utf-8")
+                else:
+                    json_path.write_text(text, encoding="utf-8")
+                wrote_json = True
+            self._manual_capture_count = int(getattr(self, "_manual_capture_count", 0)) + 1
+            detail = f"{len(detections)} detections + .json" if wrote_json else "nothing classified, image only"
+            self.reason_label.setText(f"Saved {raw_path.name} ({detail})")
+            self.log(f"MANUAL_CAPTURE_INFERENCE {raw_path.name} detections={len(detections)} json={wrote_json}")
             return True
         except Exception as e:
             self.reason_label.setText(f"Capture failed: {e}")
