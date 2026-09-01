@@ -45,7 +45,7 @@ from PySide6.QtWidgets import (
 
 from camera_backend import BaslerPylonCamera, create_camera_backend, list_basler_cameras
 
-APP_TITLE = "BungVision Python Line-Side HMI v0.9.115 Capture + Detect"
+APP_TITLE = "BungVision Python Line-Side HMI v0.9.116 Windows Portability"
 ROOT = Path(__file__).resolve().parent
 LOG_DIR = ROOT / "logs"
 FAIL_DIR = ROOT / "fail_snapshots"
@@ -761,6 +761,46 @@ PLC_TAG_LONG_DESCRIPTIONS = {
 
 # Held open for the life of the process so the instance lock stays held.
 _INSTANCE_LOCK_HANDLE = None
+# The lock file is only ever locked, never read. Ownership details go in a
+# separate file so a refused instance can always read who holds the lock
+# without contending for it (a locked byte range is not readable on Windows).
+_INSTANCE_LOCK_NAME = "bungvision.lock"
+_INSTANCE_OWNER_NAME = "bungvision.pid"
+
+
+def _lock_file_exclusive(handle) -> Optional[bool]:
+    """Take a non-blocking exclusive lock on the first byte of an open file.
+
+    Returns True when locked, False when another process holds it, and None when
+    this platform offers no locking mechanism at all. The None case is kept
+    distinct so a missing mechanism skips the guard instead of being mistaken for
+    a running instance and blocking startup.
+
+    Both mechanisms are released by the OS when the owning process exits (even
+    when killed), so there is no stale-lock recovery to do.
+    """
+    try:
+        if os.name == "nt":
+            import msvcrt
+        else:
+            import fcntl
+    except Exception:
+        return None
+    try:
+        if os.name == "nt":
+            # msvcrt locks a byte range from the current position; make sure the
+            # byte exists so the range is well defined.
+            handle.seek(0, os.SEEK_END)
+            if handle.tell() == 0:
+                handle.write(".")
+                handle.flush()
+            handle.seek(0)
+            msvcrt.locking(handle.fileno(), msvcrt.LK_NBLCK, 1)
+        else:
+            fcntl.flock(handle.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+        return True
+    except Exception:
+        return False
 
 
 def acquire_single_instance_lock() -> Tuple[bool, str]:
@@ -772,9 +812,9 @@ def acquire_single_instance_lock() -> Tuple[bool, str]:
     Bypass and Ready appear to flicker. Because Bypass suppresses the vision stop
     request, that is a safety problem, so a second copy is refused.
 
-    Uses an exclusive flock, which the kernel drops automatically when the owning
-    process exits (even on SIGKILL), so there is no stale-lock recovery to do.
-    Set BUNGVISION_ALLOW_MULTIPLE=1 to override for development.
+    Works on both POSIX (flock) and Windows (msvcrt), because the same hazard
+    exists on either platform. Set BUNGVISION_ALLOW_MULTIPLE=1 to override for
+    development.
 
     Returns (acquired, detail_about_existing_instance).
     """
@@ -782,38 +822,50 @@ def acquire_single_instance_lock() -> Tuple[bool, str]:
     if str(os.environ.get("BUNGVISION_ALLOW_MULTIPLE", "")).strip().lower() in ("1", "true", "yes"):
         return True, ""
     try:
-        import fcntl
+        handle = open(LOG_DIR / _INSTANCE_LOCK_NAME, "a+")
     except Exception:
-        # Non-POSIX platform: skip the guard rather than block startup.
+        # Cannot create the lock file at all: do not block startup over it.
         return True, ""
-    try:
-        handle = open(LOG_DIR / "bungvision.lock", "a+")
-    except Exception:
+    locked = _lock_file_exclusive(handle)
+    if locked is None:
+        # No locking mechanism on this platform: skip the guard rather than
+        # refuse to start.
+        _INSTANCE_LOCK_HANDLE = handle
         return True, ""
-    try:
-        fcntl.flock(handle.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
-    except OSError:
-        detail = ""
-        try:
-            handle.seek(0)
-            detail = handle.read().strip()
-        except Exception:
-            pass
+    if not locked:
         try:
             handle.close()
         except Exception:
             pass
+        detail = ""
+        try:
+            detail = (LOG_DIR / _INSTANCE_OWNER_NAME).read_text(encoding="utf-8").strip()
+        except Exception:
+            pass
         return False, detail
     try:
-        handle.seek(0)
-        handle.truncate()
-        handle.write(f"pid={os.getpid()} started={dt.datetime.now().isoformat(timespec='seconds')}\n")
-        handle.flush()
+        (LOG_DIR / _INSTANCE_OWNER_NAME).write_text(
+            f"pid={os.getpid()} started={dt.datetime.now().isoformat(timespec='seconds')}\n",
+            encoding="utf-8",
+        )
     except Exception:
         pass
     # Hold the handle for the life of the process so the lock stays held.
     _INSTANCE_LOCK_HANDLE = handle
     return True, ""
+
+
+def _opencv_api_help() -> str:
+    """Platform-appropriate help for the camera capture backend choice."""
+    if sys.platform.startswith("win"):
+        return ("Capture backend for USB/UVC cameras. DirectShow is the safest default on "
+                "Windows; try MSMF if a camera will not open or caps out on frame rate. "
+                "(V4L2/GStreamer are Linux-only and are not offered here.)")
+    if sys.platform.startswith("linux"):
+        return ("Auto/V4L2: software MJPG decode (~15fps at 5MP on Jetson). GStreamer: uses "
+                "the Jetson hardware MJPG decoder (nvv4l2decoder/nvjpegdec) — recommended for "
+                "full-res USB cameras on Jetson AGX/NX (enables 30fps at 2592x1944).")
+    return "Capture backend OpenCV uses to open the camera."
 
 
 def find_duplicate_plc_tags(tags: dict) -> List[str]:
@@ -3252,7 +3304,17 @@ class SettingsDialog(QDialog):
         self.camera_backend_local.addItems(["OpenCV", "Basler/Pylon"])
         self.source_edit_local = QLineEdit(); self.source_edit_local.setMaximumWidth(140)
         self.opencv_api_local = QComboBox()
-        self.opencv_api_local.addItems(["Auto", "DirectShow", "MSMF", "V4L2", "GStreamer"])
+        # Only offer backends that exist on this platform: DirectShow/MSMF are
+        # Windows-only, V4L2/GStreamer are Linux-only. The canonical value is
+        # stored as item data, so the mapping never depends on index order.
+        if sys.platform.startswith("win"):
+            api_choices = [("Auto", "auto"), ("DirectShow", "dshow"), ("MSMF", "msmf")]
+        elif sys.platform.startswith("linux"):
+            api_choices = [("Auto", "auto"), ("V4L2", "v4l2"), ("GStreamer", "gstreamer")]
+        else:
+            api_choices = [("Auto", "auto")]
+        for _label, _value in api_choices:
+            self.opencv_api_local.addItem(_label, _value)
         self.basler_serial_local = QLineEdit(); self.basler_serial_local.setMaximumWidth(180)
         self.camera_width_local = self._spin(2592, 320, 8192, 1)
         self.camera_height_local = self._spin(1944, 240, 8192, 1)
@@ -3282,7 +3344,7 @@ class SettingsDialog(QDialog):
         self.yolo_iou_spin_local = self._spin(45, 1, 99, 1)
         self._add_grid_row(rgrid, 0, 0, "Backend", self.camera_backend_local, "OpenCV for USB/UVC/video paths. Basler/Pylon uses the native pypylon grab loop.")
         self._add_grid_row(rgrid, 0, 1, "OpenCV Src", self.source_edit_local, "Camera index or video path. Used only by the OpenCV backend.")
-        self._add_grid_row(rgrid, 1, 0, "OpenCV API", self.opencv_api_local, "Auto/V4L2: software MJPG decode (~15fps at 5MP on Jetson). GStreamer: uses nvjpegdec for hardware MJPG decode — recommended for full-res USB cameras on Jetson AGX/NX (enables 30fps at 2592x1944).")
+        self._add_grid_row(rgrid, 1, 0, "OpenCV API", self.opencv_api_local, _opencv_api_help())
         self._add_grid_row(rgrid, 1, 1, "Basler SN", self.basler_serial_local, "Optional Basler serial number. Leave blank to use the first detected Basler camera.")
         self._add_grid_row(rgrid, 2, 0, "Cam FPS", self.camera_fps_local, "Requested camera frame rate. Actual value depends on camera and exposure.")
         self._add_grid_row(rgrid, 2, 1, "Width", self.camera_width_local, "Requested camera width in pixels.")
@@ -3494,8 +3556,13 @@ class SettingsDialog(QDialog):
         backend = str(getattr(p, "camera_backend", "opencv")).lower()
         self.camera_backend_local.setCurrentIndex(1 if backend in ("basler", "pylon", "basler/pylon") else 0)
         self.source_edit_local.setText(p.source_edit.text() if hasattr(p, "source_edit") else "0")
-        api_map = {"auto": 0, "dshow": 1, "directshow": 1, "msmf": 2, "v4l2": 3, "gstreamer": 4, "gst": 4}
-        self.opencv_api_local.setCurrentIndex(api_map.get(str(getattr(p, "opencv_api", "auto")).strip().lower(), 0))
+        # Match by stored value, not index. A setting carrying a backend that does
+        # not exist on this platform (e.g. gstreamer in a config moved from a
+        # Jetson to Windows) simply falls back to Auto.
+        _api = str(getattr(p, "opencv_api", "auto")).strip().lower()
+        _api = {"directshow": "dshow", "gst": "gstreamer"}.get(_api, _api)
+        _idx = self.opencv_api_local.findData(_api)
+        self.opencv_api_local.setCurrentIndex(_idx if _idx >= 0 else 0)
         self.basler_serial_local.setText(str(getattr(p, "basler_serial", "")))
         cam_w = int(getattr(p, "camera_width", 2592))
         cam_h = int(getattr(p, "camera_height", 1944))
@@ -3575,8 +3642,7 @@ class SettingsDialog(QDialog):
         )
         p.camera_backend = "basler" if self.camera_backend_local.currentIndex() == 1 else "opencv"
         p.source_edit.setText(self.source_edit_local.text().strip())
-        api_values = ["auto", "dshow", "msmf", "v4l2", "gstreamer"]
-        p.opencv_api = api_values[self.opencv_api_local.currentIndex()] if self.opencv_api_local.currentIndex() < len(api_values) else "auto"
+        p.opencv_api = str(self.opencv_api_local.currentData() or "auto")
         p.basler_serial = self.basler_serial_local.text().strip()
         p.camera_width = int(self.camera_width_local.value())
         p.camera_height = int(self.camera_height_local.value())
@@ -8058,7 +8124,9 @@ def main():
               "machine sees the outputs flicker between them — including Bypass, "
               "which suppresses the vision stop request.\n\n"
               "Switch to the copy that is already running. If it is not on screen, "
-              "close it from the task bar (or reboot the panel) and start again.",
+              "close it from the task bar (or reboot the panel) and start again.\n\n"
+              "If you are certain no other copy is running, set the environment "
+              "variable BUNGVISION_ALLOW_MULTIPLE=1 to start anyway.",
         )
         sys.exit(1)
 

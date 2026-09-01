@@ -1158,7 +1158,12 @@ def create_camera_backend(
     # When the user selects GStreamer and OpenCV has no GStreamer support
     # (the common pip opencv-python wheel), use the native python-gi backend
     # which drives GStreamer directly and works regardless of the OpenCV build.
-    if normalize_opencv_api(opencv_api) == "gstreamer":
+    #
+    # Linux only: that backend needs python-gi, /dev/videoN and the Jetson
+    # nv* decode plugins. A settings file carried over from a Jetson can still
+    # say "gstreamer", so fall through to the normal OpenCV backend elsewhere
+    # rather than handing back a camera that can never open.
+    if normalize_opencv_api(opencv_api) == "gstreamer" and sys.platform.startswith("linux"):
         try:
             cv_has_gst = "GStreamer:                   NO" not in cv2.getBuildInformation()
         except Exception:
